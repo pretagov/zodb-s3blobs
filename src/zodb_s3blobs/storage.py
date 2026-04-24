@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import logging
 import os
@@ -45,7 +46,7 @@ def _ensure_relstorage_lock_early():
     _relstorage_lock_early_applied = True
 
 
-_BLOB_KEY_RE = re.compile(r"^blobs/([0-9a-f]+)/[0-9a-f]+\.blob$")
+_BLOB_KEY_RE = re.compile(r"^blobs/([0-9a-f]+)/([0-9a-f]+)\.blob$")
 
 # Marker file format written by upload handlers that have already streamed
 # the blob bytes directly to S3. The marker travels on-disk through any ZODB
@@ -347,21 +348,97 @@ class S3BlobStorage:
     # -- Pack / GC --
 
     def pack(self, pack_time, referencesf):
-        # Pack the base storage first
-        self.__storage.pack(pack_time, referencesf)
-        # GC: remove S3 keys for unreachable OIDs
+        """Pack the base storage, then GC S3 keys using the same rules as
+        ZODB's ``_packNonUndoing``: for each OID, keep only the current
+        revision's key and delete everything else. If the OID is gone from
+        the base storage entirely, delete all of its keys.
+
+        Existence is checked via ``ZODB.utils.load_current`` (which uses
+        ``loadBefore``) rather than ``storage.load``: the latter can return
+        stale cached state on MVCC/RelStorage and would treat already-packed
+        OIDs as still alive, leaving orphan S3 objects behind.
+        """
+        unproxied = self.__storage
+        result = unproxied.pack(pack_time, referencesf)
+
+        # Group keys by oid so we can decide per-oid whether to delete all
+        # revisions (oid gone) or only the non-current ones.
+        keys_by_oid = collections.defaultdict(list)
+        bad_keys = 0
+        total_keys = 0
         for key in self._s3_client.list_objects("blobs/"):
-            oid = self._oid_from_key(key)
-            if oid is None:
+            total_keys += 1
+            m = _BLOB_KEY_RE.match(key)
+            if m is None:
+                bad_keys += 1
+                logger.debug("GC: skipping unparseable S3 key %s", key)
                 continue
             try:
-                self.__storage.load(oid)
-            except ZODB.POSException.POSKeyError:
-                logger.info("GC: removing orphaned S3 key %s", key)
+                oid = ZODB.utils.p64(int(m.group(1), 16))
+            except (ValueError, OverflowError):
+                bad_keys += 1
+                continue
+            tid_hex = m.group(2)
+            keys_by_oid[oid].append((tid_hex, key))
+
+        logger.info(
+            "GC: scanning %d S3 blob keys across %d oids (unparseable=%d)",
+            total_keys,
+            len(keys_by_oid),
+            bad_keys,
+        )
+
+        deleted_orphan = 0
+        deleted_old_rev = 0
+        for oid, entries in keys_by_oid.items():
+            try:
+                _data, current_tid = ZODB.utils.load_current(unproxied, oid)
+                oid_exists = True
+            except (ZODB.POSException.POSKeyError, KeyError):
+                oid_exists = False
+                current_tid = None
+
+            if not oid_exists:
+                for _entry_tid, key in entries:
+                    logger.info("GC: removing orphaned S3 key %s (oid gone)", key)
+                    try:
+                        self._s3_client.delete_object(key)
+                        deleted_orphan += 1
+                    except Exception:
+                        logger.warning(
+                            "GC: failed to delete orphan S3 key %s",
+                            key,
+                            exc_info=True,
+                        )
+                continue
+
+            # OID still alive: keep only the current revision; drop older tids.
+            current_tid_hex = _tid_hex(current_tid)
+            for tid_hex, key in entries:
+                if tid_hex == current_tid_hex:
+                    continue
+                logger.info(
+                    "GC: removing stale revision S3 key %s "
+                    "(current_tid=%s)",
+                    key,
+                    current_tid_hex,
+                )
                 try:
                     self._s3_client.delete_object(key)
+                    deleted_old_rev += 1
                 except Exception:
-                    logger.warning("GC: failed to delete S3 key %s", key, exc_info=True)
+                    logger.warning(
+                        "GC: failed to delete stale S3 key %s",
+                        key,
+                        exc_info=True,
+                    )
+
+        logger.info(
+            "GC: done. deleted_orphan=%d deleted_old_rev=%d",
+            deleted_orphan,
+            deleted_old_rev,
+        )
+        return result
 
     @staticmethod
     def _oid_from_key(key):
