@@ -196,6 +196,55 @@ mc alias set local http://localhost:9000 minioadmin minioadmin
 mc mb local/zodb-blobs
 ```
 
+## Migrating existing blobs from RelStorage to S3
+
+If you already run Plone / ZODB on RelStorage with blob bytes stored in
+Postgres (`blob-cache-size` set, no `shared-blob-dir true`), the
+`zodb-s3blobs-migrate` CLI copies every committed blob into S3 under the
+same key scheme `S3BlobStorage` reads. After the copy completes, switch
+the storage config from `<relstorage>` to `<s3blobstorage>` (wrapping the
+same `<relstorage>`) and restart.
+
+The migration does not modify the database and is safe to interrupt — a
+subsequent run uses `head_object` to skip keys already in S3. The operator
+is responsible for ensuring no writes happen between the copy and the
+config switch.
+
+```bash
+# Required env (or use --flags): S3_BLOB_BUCKET, S3_BLOB_ENDPOINT_URL,
+# S3_BLOB_REGION, S3_ACCESS_KEY, S3_SECRET_KEY, and optionally
+# S3_BLOB_PREFIX / S3_BLOB_SSE_CUSTOMER_KEY.
+zodb-s3blobs-migrate \
+    --dsn "host=db port=5432 dbname=plone user=... password=..." \
+    --blob-cache-dir /app/var/relstorage-blobs/relstorage-04 \
+    --blob-cache-size 1GB \
+    --workers 8 \
+    --evict-after-upload \
+    --verify-size
+```
+
+Useful flags:
+
+- `--dry-run` — walk and log, no S3 writes.
+- `--count-only` — report the number of `blobs/` keys already in S3.
+- `--overwrite` — re-upload even if the target key exists.
+- `--verify-size` — after a `head_object` hit, compare `ContentLength`
+  against the summed `blob_chunk` length; re-upload on mismatch.
+- `--evict-after-upload` — unlink the RelStorage cache copy after a
+  successful upload (keeps disk use bounded to roughly one file per
+  worker).
+
+After the run, audit by comparing counts:
+
+```bash
+psql "$DSN" -c 'SELECT COUNT(DISTINCT (zoid, tid)) FROM blob_chunk;'
+zodb-s3blobs-migrate --count-only  # (plus --bucket/--endpoint-url/...)
+```
+
+SSE-C note: if the target bucket is encrypted with SSE-C, the exact same
+customer key bytes must be supplied to both the migration and the runtime
+`<s3blobstorage>` config.
+
 ## Development
 
 ```bash
