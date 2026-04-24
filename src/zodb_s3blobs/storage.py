@@ -48,7 +48,10 @@ def _ensure_relstorage_lock_early():
 _BLOB_KEY_RE = re.compile(r"^blobs/([0-9a-f]+)/[0-9a-f]+\.blob$")
 
 
-@zope.interface.implementer(ZODB.interfaces.IBlobStorage)
+@zope.interface.implementer(
+    ZODB.interfaces.IBlobStorage,
+    ZODB.interfaces.IMVCCStorage,
+)
 class S3BlobStorage:
     """ZODB storage wrapper that redirects blob operations to S3.
 
