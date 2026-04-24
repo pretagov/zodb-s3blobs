@@ -165,6 +165,85 @@ class S3Client:
                 return None
             self._wrap_client_error(e, "head", s3_key)
 
+    def create_multipart_upload(self, s3_key):
+        full_key = self._full_key(s3_key)
+        try:
+            response = self._client.create_multipart_upload(
+                Bucket=self.bucket_name, Key=full_key, **self._sse_extra_args
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "create_multipart_upload", s3_key)
+        return response["UploadId"]
+
+    def upload_part(self, s3_key, upload_id, part_number, body):
+        full_key = self._full_key(s3_key)
+        try:
+            response = self._client.upload_part(
+                Bucket=self.bucket_name,
+                Key=full_key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=body,
+                **self._sse_extra_args,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "upload_part", s3_key)
+        return response["ETag"]
+
+    def complete_multipart_upload(self, s3_key, upload_id, parts):
+        full_key = self._full_key(s3_key)
+        try:
+            self._client.complete_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=full_key,
+                UploadId=upload_id,
+                MultipartUpload={
+                    "Parts": [
+                        {"PartNumber": p["PartNumber"], "ETag": p["ETag"]}
+                        for p in parts
+                    ]
+                },
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "complete_multipart_upload", s3_key)
+
+    def abort_multipart_upload(self, s3_key, upload_id):
+        full_key = self._full_key(s3_key)
+        try:
+            self._client.abort_multipart_upload(
+                Bucket=self.bucket_name, Key=full_key, UploadId=upload_id
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "abort_multipart_upload", s3_key)
+
+    def copy_object(self, src_key, dst_key):
+        """Server-side copy from src_key to dst_key within the same bucket.
+
+        Uses the managed ``client.copy()`` API which transparently switches to
+        multipart copy (``UploadPartCopy``) for objects above the single-call
+        5 GiB limit. S3 has no rename primitive; server-side copy is the
+        equivalent and does not transfer bytes over the network in normal
+        S3 / Minio deployments.
+        """
+        full_src = self._full_key(src_key)
+        full_dst = self._full_key(dst_key)
+        extra = dict(self._sse_extra_args)
+        if self._sse_extra_args:
+            # Source must be decrypted with the same customer key
+            extra["CopySourceSSECustomerAlgorithm"] = self._sse_extra_args[
+                "SSECustomerAlgorithm"
+            ]
+            extra["CopySourceSSECustomerKey"] = self._sse_extra_args["SSECustomerKey"]
+        try:
+            self._client.copy(
+                CopySource={"Bucket": self.bucket_name, "Key": full_src},
+                Bucket=self.bucket_name,
+                Key=full_dst,
+                ExtraArgs=extra or None,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "copy_object", dst_key)
+
     def list_objects(self, prefix=""):
         full_prefix = self._full_key(prefix) if prefix else self._prefix
         paginator = self._client.get_paginator("list_objects_v2")
