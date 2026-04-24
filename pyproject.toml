@@ -35,6 +35,9 @@ Repository = "https://github.com/bluedynamics/zodb-s3blobs"
 Changelog = "https://github.com/bluedynamics/zodb-s3blobs/blob/main/CHANGES.md"
 Issues = "https://github.com/bluedynamics/zodb-s3blobs/issues"
 
+[project.scripts]
+zodb-s3blobs-migrate = "zodb_s3blobs.migrate:main"
+
 [project.optional-dependencies]
 test = [
     "pytest",
