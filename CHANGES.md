@@ -6,6 +6,11 @@
   `write_staged_marker()` is committed by copying its staging key, a single
   key under `tus-staging/`, server-side instead of uploading the file.
 
+- Add `zodb-s3blobs-migrate` CLI for copying existing blobs from a RelStorage
+  Postgres backend into S3. Enumerates `(zoid, tid)` pairs via `blob_chunk`,
+  uploads each blob under the same `blobs/{oid_hex}/{tid_hex}.blob` key
+  scheme `S3BlobStorage` reads, and is idempotent via `head_object`.
+
 ## 1.2.1
 
 - Log why blob downloads fail. Every failed attempt on the download client
