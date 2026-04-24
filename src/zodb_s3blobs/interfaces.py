@@ -19,6 +19,21 @@ class IS3Client(Interface):
     def list_objects(prefix):
         """Yield S3 keys matching the given prefix."""
 
+    def create_multipart_upload(s3_key):
+        """Initiate a multipart upload; return the UploadId."""
+
+    def upload_part(s3_key, upload_id, part_number, body):
+        """Upload a single part; return the ETag."""
+
+    def complete_multipart_upload(s3_key, upload_id, parts):
+        """Complete a multipart upload. parts is a list of {PartNumber, ETag}."""
+
+    def abort_multipart_upload(s3_key, upload_id):
+        """Abort a multipart upload and discard any uploaded parts."""
+
+    def copy_object(src_key, dst_key):
+        """Server-side copy of one S3 object to another key in the same bucket."""
+
 
 class IS3BlobCache(Interface):
     """Local filesystem LRU cache for S3 blobs."""
