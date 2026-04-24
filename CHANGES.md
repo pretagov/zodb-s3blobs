@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add `zodb-s3blobs-migrate` CLI for copying existing blobs from a RelStorage
+  Postgres backend into S3. Enumerates `(zoid, tid)` pairs via `blob_chunk`,
+  uploads each blob under the same `blobs/{oid_hex}/{tid_hex}.blob` key
+  scheme `S3BlobStorage` reads, and is idempotent via `head_object`.
+
 ## 1.1.0
 
 - Add `multipart_threshold` parameter (default: 5 GB) to disable multipart
