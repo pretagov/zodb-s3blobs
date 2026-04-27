@@ -171,6 +171,34 @@ s3-sse-customer-key $S3_SSE_KEY
 
 **Security note:** The SSE-C key is held in process memory for the lifetime of the storage instance. In long-running servers, consider using IAM-based encryption (SSE-KMS) instead if memory exposure is a concern. Python's string handling makes secure memory clearing impractical.
 
+## Migrating with zodbconvert
+
+`S3BlobStorage` can be a `zodbconvert` destination: blobs from the source
+storage are uploaded to S3 as part of the copy. The wrapper implements
+`copyTransactionsFrom` and `restoreBlob` so the upload routes through the
+same two-phase commit path as normal writes (upload during `tpc_vote`,
+delete uploaded keys on `tpc_abort`).
+
+Example destination snippet (history-preserving RelStorage backend):
+
+```
+%import zodb_s3blobs
+
+<s3blobstorage destination>
+    bucket-name my-blobs
+    s3-region us-east-1
+    cache-dir /var/lib/blob-cache
+    cache-size 1GB
+    <relstorage>
+        blob-dir /var/lib/blob-cache
+        shared-blob-dir false
+        <postgresql>
+            dsn host='db' dbname='dest' user='u' password='p'
+        </postgresql>
+    </relstorage>
+</s3blobstorage>
+```
+
 ## Using with MinIO (dev setup)
 
 **Warning:** The credentials below are MinIO defaults for local development only. Never use default credentials in production.

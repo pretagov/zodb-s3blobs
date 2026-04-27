@@ -193,6 +193,33 @@ class S3BlobStorage:
             blobfilename,
         )
 
+    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
+        """Blob counterpart to ``IStorageRestoreable.restore``.
+
+        Used by ``zodbconvert`` (via ``relstorage.storage.copy.Copy``) when
+        copying a blob record from a source storage. Stages the blob in the
+        wrapper's temp dir; the existing ``tpc_vote`` flow uploads it to S3.
+        """
+        self.__storage.restore(oid, serial, data, "", prev_txn, transaction)
+
+        oid_hex = _oid_hex(oid)
+        staged_path = os.path.join(self._temp_dir, f"{oid_hex}.blob")
+        shutil.move(blobfilename, staged_path)
+        self._pending_blobs[oid] = staged_path
+
+    def copyTransactionsFrom(self, other):
+        """Drive a zodbconvert-style copy through the S3 wrapper.
+
+        RelStorage's own ``copyTransactionsFrom`` constructs ``Copy`` with
+        ``self`` (the inner relstorage) as both ``tpc`` and ``restore``,
+        bypassing this wrapper entirely. We reimplement it here so ``Copy``
+        routes blob restores through ``restoreBlob`` above and through this
+        wrapper's two-phase commit hooks — meaning blobs land in S3 rather
+        than in the inner relstorage's local blob-dir.
+        """
+        from relstorage.storage.copy import Copy
+        Copy(self, self, self).copyTransactionsFrom(other)
+
     def loadBlob(self, oid, serial):
         # Check pending blobs first (stored in current txn, not yet in S3)
         pending = self._pending_blobs.get(oid)
