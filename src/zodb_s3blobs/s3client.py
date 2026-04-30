@@ -216,6 +216,32 @@ class S3Client:
         except ClientError as e:
             self._wrap_client_error(e, "abort_multipart_upload", s3_key)
 
+    def list_parts(self, s3_key, upload_id):
+        """Return all parts uploaded so far for a multipart upload.
+
+        Returns a list of ``{"PartNumber": int, "ETag": str, "Size": int}``,
+        sorted by PartNumber ascending. Handles pagination transparently.
+        """
+        full_key = self._full_key(s3_key)
+        parts = []
+        try:
+            paginator = self._client.get_paginator("list_parts")
+            for page in paginator.paginate(
+                Bucket=self.bucket_name, Key=full_key, UploadId=upload_id
+            ):
+                for p in page.get("Parts", []):
+                    parts.append(
+                        {
+                            "PartNumber": p["PartNumber"],
+                            "ETag": p["ETag"],
+                            "Size": p["Size"],
+                        }
+                    )
+        except ClientError as e:
+            self._wrap_client_error(e, "list_parts", s3_key)
+        parts.sort(key=lambda p: p["PartNumber"])
+        return parts
+
     def copy_object(self, src_key, dst_key):
         """Server-side copy from src_key to dst_key within the same bucket.
 
