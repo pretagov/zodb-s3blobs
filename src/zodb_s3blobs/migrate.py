@@ -386,6 +386,42 @@ def _env(name, default=None):
     return os.environ.get(name, default)
 
 
+def _augment_dsn_with_keepalives(dsn, *, keepalives, idle, interval, count):
+    """Append libpq tcp keepalive params to ``dsn`` and return the result.
+
+    Handles both DSN forms libpq accepts: space-separated ``key=value`` and
+    URL (``postgres://`` / ``postgresql://``). Existing keepalive params in
+    the DSN are left untouched on the assumption that an explicit DSN value
+    overrides the CLI default.
+    """
+    params = {
+        "keepalives": str(keepalives),
+        "keepalives_idle": str(idle),
+        "keepalives_interval": str(interval),
+        "keepalives_count": str(count),
+    }
+
+    if dsn.startswith(("postgres://", "postgresql://")):
+        from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+
+        parsed = urlparse(dsn)
+        existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for k, v in params.items():
+            existing.setdefault(k, v)
+        return urlunparse(parsed._replace(query=urlencode(existing)))
+
+    existing_keys = {
+        token.split("=", 1)[0] for token in dsn.split() if "=" in token
+    }
+    suffix = " ".join(
+        f"{k}={v}" for k, v in params.items() if k not in existing_keys
+    )
+    if not suffix:
+        return dsn
+    sep = "" if dsn.endswith(" ") or not dsn else " "
+    return f"{dsn}{sep}{suffix}"
+
+
 def _parse_size(s):
     """Parse "1GB" / "512MB" / "1048576" → bytes. Accepts common suffixes."""
     if s is None:
@@ -452,6 +488,32 @@ def build_argparser():
         choices=("auto", "path", "virtual"),
     )
 
+    p.add_argument(
+        "--keepalives",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="libpq tcp keepalives flag. Default 1 (enabled). Set 0 to disable.",
+    )
+    p.add_argument(
+        "--keepalives-idle",
+        type=int,
+        default=30,
+        help="Seconds of inactivity before sending a keepalive. Default 30.",
+    )
+    p.add_argument(
+        "--keepalives-interval",
+        type=int,
+        default=10,
+        help="Seconds between keepalive retransmits. Default 10.",
+    )
+    p.add_argument(
+        "--keepalives-count",
+        type=int,
+        default=3,
+        help="Failed keepalives before the connection is dropped. Default 3.",
+    )
+
     p.add_argument("--workers", type=int, default=8)
     p.add_argument(
         "--overwrite",
@@ -514,8 +576,16 @@ def main(argv=None):
         print("error: --dsn or RELSTORAGE_DSN is required", file=sys.stderr)
         return 2
 
+    dsn = _augment_dsn_with_keepalives(
+        args.dsn,
+        keepalives=args.keepalives,
+        idle=args.keepalives_idle,
+        interval=args.keepalives_interval,
+        count=args.keepalives_count,
+    )
+
     storage = open_relstorage(
-        dsn=args.dsn,
+        dsn=dsn,
         blob_cache_dir=args.blob_cache_dir,
         blob_cache_size=_parse_size(args.blob_cache_size),
         keep_history=args.keep_history,
