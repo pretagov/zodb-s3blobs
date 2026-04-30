@@ -348,21 +348,32 @@ class S3BlobStorage:
     # -- Pack / GC --
 
     def pack(self, pack_time, referencesf):
-        """Pack the base storage, then GC S3 keys using the same rules as
-        ZODB's ``_packNonUndoing``: for each OID, keep only the current
-        revision's key and delete everything else. If the OID is gone from
-        the base storage entirely, delete all of its keys.
+        """Pack the base storage, then GC S3 keys to match what the base
+        storage retains.
 
-        Existence is checked via ``ZODB.utils.load_current`` (which uses
-        ``loadBefore``) rather than ``storage.load``: the latter can return
-        stale cached state on MVCC/RelStorage and would treat already-packed
-        OIDs as still alive, leaving orphan S3 objects behind.
+        For history-free storages (and any non-RelStorage base) the rule is
+        ``_packNonUndoing``: keep the current revision per OID, drop the rest.
+
+        For history-preserving RelStorage we mirror ``object_state`` after
+        pack: keep every ``(oid, tid)`` row that survived, drop everything
+        else. RelStorage HP pack honours ``pack_time`` — revisions newer than
+        it remain in ``object_state`` so that undo within the retention window
+        works — and the S3 side now does the same, instead of unconditionally
+        dropping every non-current revision.
+
+        OIDs that no longer exist in the base storage have all their S3 keys
+        deleted as orphans.
+
+        Liveness is sourced via ``ZODB.utils.load_current`` (or, in HP mode,
+        a direct ``object_state`` query) rather than ``storage.load``, which
+        can return stale cached state on MVCC/RelStorage and treat
+        already-packed OIDs as still alive.
         """
         unproxied = self.__storage
         result = unproxied.pack(pack_time, referencesf)
 
-        # Group keys by oid so we can decide per-oid whether to delete all
-        # revisions (oid gone) or only the non-current ones.
+        # Group keys by oid so we can decide per-oid which (if any) tids
+        # survive in the base storage.
         keys_by_oid = collections.defaultdict(list)
         bad_keys = 0
         total_keys = 0
@@ -388,17 +399,14 @@ class S3BlobStorage:
             bad_keys,
         )
 
+        live = self._live_revisions_for_oids(keys_by_oid.keys())
+
         deleted_orphan = 0
         deleted_old_rev = 0
         for oid, entries in keys_by_oid.items():
-            try:
-                _data, current_tid = ZODB.utils.load_current(unproxied, oid)
-                oid_exists = True
-            except (ZODB.POSException.POSKeyError, KeyError):
-                oid_exists = False
-                current_tid = None
+            live_tids = live.get(oid, frozenset())
 
-            if not oid_exists:
+            if not live_tids:
                 for _entry_tid, key in entries:
                     logger.info("GC: removing orphaned S3 key %s (oid gone)", key)
                     try:
@@ -412,16 +420,14 @@ class S3BlobStorage:
                         )
                 continue
 
-            # OID still alive: keep only the current revision; drop older tids.
-            current_tid_hex = _tid_hex(current_tid)
             for tid_hex, key in entries:
-                if tid_hex == current_tid_hex:
+                if tid_hex in live_tids:
                     continue
                 logger.info(
                     "GC: removing stale revision S3 key %s "
-                    "(current_tid=%s)",
+                    "(live_tids=%s)",
                     key,
-                    current_tid_hex,
+                    sorted(live_tids),
                 )
                 try:
                     self._s3_client.delete_object(key)
@@ -439,6 +445,62 @@ class S3BlobStorage:
             deleted_old_rev,
         )
         return result
+
+    def _live_revisions_for_oids(self, oids):
+        """Return ``{oid_bytes: frozenset(tid_hex_strings)}`` for the OIDs
+        that still exist in the base storage post-pack.
+
+        Dispatches to the HP RelStorage path when the base storage is
+        history-preserving and exposes a RelStorage-shaped ``_adapter``;
+        otherwise uses the generic ``load_current``-based path.
+        """
+        base = self.__storage
+        options = getattr(base, "_options", None)
+        keep_history = bool(getattr(options, "keep_history", False))
+        if keep_history and hasattr(base, "_adapter"):
+            return self._live_revisions_via_object_state(oids)
+        return self._live_revisions_via_load_current(oids)
+
+    def _live_revisions_via_load_current(self, oids):
+        """Generic / history-free path. At most one revision per OID."""
+        out = {}
+        for oid in oids:
+            try:
+                _data, current_tid = ZODB.utils.load_current(self.__storage, oid)
+            except (ZODB.POSException.POSKeyError, KeyError):
+                continue
+            out[oid] = frozenset({_tid_hex(current_tid)})
+        return out
+
+    def _live_revisions_via_object_state(self, oids):
+        """History-preserving RelStorage path.
+
+        Returns every ``(zoid, tid)`` row from ``object_state`` for the
+        requested OIDs, batched to keep IN-clauses bounded on large packs.
+        """
+        adapter = self.__storage._adapter
+        oids_list = list(oids)
+        if not oids_list:
+            return {}
+        out = collections.defaultdict(set)
+        BATCH = 1000
+        conn, cursor = adapter.connmanager.open_for_load()
+        try:
+            for i in range(0, len(oids_list), BATCH):
+                chunk = oids_list[i : i + BATCH]
+                zoids = [ZODB.utils.u64(oid) for oid in chunk]
+                placeholders = ",".join(["%s"] * len(zoids))
+                cursor.execute(
+                    f"SELECT zoid, tid FROM object_state "
+                    f"WHERE zoid IN ({placeholders})",
+                    zoids,
+                )
+                for zoid, tid in cursor.fetchall():
+                    oid_bytes = ZODB.utils.p64(int(zoid))
+                    out[oid_bytes].add(_tid_hex(ZODB.utils.p64(int(tid))))
+        finally:
+            adapter.connmanager.close(conn, cursor)
+        return {oid: frozenset(tids) for oid, tids in out.items()}
 
     @staticmethod
     def _oid_from_key(key):
