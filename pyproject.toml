@@ -37,6 +37,7 @@ Issues = "https://github.com/bluedynamics/zodb-s3blobs/issues"
 
 [project.scripts]
 zodb-s3blobs-migrate = "zodb_s3blobs.migrate:main"
+zodb-s3blobs-compare = "zodb_s3blobs.compare:main"
 
 [project.optional-dependencies]
 test = [
