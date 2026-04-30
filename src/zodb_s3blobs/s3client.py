@@ -220,16 +220,22 @@ class S3Client:
         """Return all parts uploaded so far for a multipart upload.
 
         Returns a list of ``{"PartNumber": int, "ETag": str, "Size": int}``,
-        sorted by PartNumber ascending. Handles pagination transparently.
+        sorted by PartNumber ascending. Pages through the response manually
+        rather than via boto3's paginator — the paginator path occasionally
+        fails credential resolution against custom endpoints like MinIO.
         """
         full_key = self._full_key(s3_key)
         parts = []
+        part_number_marker = 0
         try:
-            paginator = self._client.get_paginator("list_parts")
-            for page in paginator.paginate(
-                Bucket=self.bucket_name, Key=full_key, UploadId=upload_id
-            ):
-                for p in page.get("Parts", []):
+            while True:
+                response = self._client.list_parts(
+                    Bucket=self.bucket_name,
+                    Key=full_key,
+                    UploadId=upload_id,
+                    PartNumberMarker=part_number_marker,
+                )
+                for p in response.get("Parts", []):
                     parts.append(
                         {
                             "PartNumber": p["PartNumber"],
@@ -237,6 +243,9 @@ class S3Client:
                             "Size": p["Size"],
                         }
                     )
+                if not response.get("IsTruncated"):
+                    break
+                part_number_marker = response["NextPartNumberMarker"]
         except ClientError as e:
             self._wrap_client_error(e, "list_parts", s3_key)
         parts.sort(key=lambda p: p["PartNumber"])
