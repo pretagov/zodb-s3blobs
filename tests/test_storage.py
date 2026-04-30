@@ -418,6 +418,124 @@ class TestPack:
         keys_after = list(s3_client.list_objects("blobs/"))
         assert len(keys_after) == 0
 
+    def test_pack_hf_drops_old_revisions_keeps_current(
+        self, storage, s3_client, tmp_path
+    ):
+        """HF / non-RelStorage base: only the current tid per OID survives."""
+        import time
+
+        self._store_root(storage)
+        oid = p64(1)
+        # First commit creates the current S3 key.
+        current_tid = self._store_blob_and_commit(
+            storage, oid, b"current", tmp_path
+        )
+
+        # Plant two synthetic stale revisions for the same OID at older tids.
+        from zodb_s3blobs.storage import _oid_hex
+
+        oid_hex = _oid_hex(oid)
+        stale_keys = [
+            f"blobs/{oid_hex}/aa.blob",
+            f"blobs/{oid_hex}/bb.blob",
+        ]
+        for key in stale_keys:
+            s3_client.upload_file(_make_blob_file(tmp_path, b"stale"), key)
+
+        assert len(list(s3_client.list_objects("blobs/"))) == 3
+
+        storage.pack(time.time(), lambda p: [p64(1)])
+
+        keys_after = set(s3_client.list_objects("blobs/"))
+        # Stale revisions gone; current revision retained.
+        assert all(k not in keys_after for k in stale_keys)
+        from zodb_s3blobs.storage import _tid_hex
+
+        current_key = f"blobs/{oid_hex}/{_tid_hex(current_tid)}.blob"
+        assert current_key in keys_after
+
+    def test_pack_hp_retains_revisions_in_object_state(
+        self, storage, s3_client, tmp_path, monkeypatch
+    ):
+        """HP RelStorage: every (oid, tid) in object_state survives, others are
+        deleted as stale. Simulates an HP base by attaching a fake _options
+        and _adapter to the underlying MappingStorage.
+        """
+        import time
+        from zodb_s3blobs.storage import _oid_hex
+        from zodb_s3blobs.storage import _tid_hex
+
+        self._store_root(storage)
+        oid = p64(1)
+        current_tid = self._store_blob_and_commit(
+            storage, oid, b"current", tmp_path
+        )
+        oid_hex = _oid_hex(oid)
+        current_tid_hex = _tid_hex(current_tid)
+
+        # Three synthetic historical revisions of the same OID.
+        retained_tid_hex = "1f4"   # int 500 → hex 1f4
+        retained_key = f"blobs/{oid_hex}/{retained_tid_hex}.blob"
+        dropped_tid_hex = "64"     # int 100 → hex 64
+        dropped_key = f"blobs/{oid_hex}/{dropped_tid_hex}.blob"
+        s3_client.upload_file(_make_blob_file(tmp_path, b"r1"), retained_key)
+        s3_client.upload_file(_make_blob_file(tmp_path, b"r0"), dropped_key)
+
+        assert len(list(s3_client.list_objects("blobs/"))) == 3
+
+        # Build a fake HP RelStorage adapter that returns specific (zoid, tid)
+        # rows from object_state. The HP path calls open_for_load → execute →
+        # fetchall → close, in that order.
+        survivors = {(1, 500), (1, int(current_tid_hex, 16))}
+
+        class _FakeCursor:
+            def __init__(self, rows):
+                self._all_rows = rows
+                self._result = []
+
+            def execute(self, sql, params):
+                wanted = set(params)
+                self._result = [r for r in self._all_rows if r[0] in wanted]
+
+            def fetchall(self):
+                return self._result
+
+        class _FakeConnManager:
+            def __init__(self, rows):
+                self._rows = rows
+                self.opened = 0
+                self.closed = 0
+
+            def open_for_load(self):
+                self.opened += 1
+                return object(), _FakeCursor(self._rows)
+
+            def close(self, conn, cursor):
+                self.closed += 1
+
+        class _FakeAdapter:
+            def __init__(self, rows):
+                self.connmanager = _FakeConnManager(rows)
+
+        class _FakeOptions:
+            keep_history = True
+
+        base = storage._S3BlobStorage__storage
+        base._options = _FakeOptions()
+        base._adapter = _FakeAdapter(list(survivors))
+
+        storage.pack(time.time(), lambda p: [p64(1)])
+
+        keys_after = set(s3_client.list_objects("blobs/"))
+        # Retained historical and current revisions both survive.
+        assert retained_key in keys_after
+        assert f"blobs/{oid_hex}/{current_tid_hex}.blob" in keys_after
+        # The revision absent from object_state is dropped.
+        assert dropped_key not in keys_after
+        # Adapter was used (sanity check that we took the HP path).
+        assert base._adapter.connmanager.opened == 1
+        assert base._adapter.connmanager.closed == 1
+
 
 class TestOidFromKey:
     def test_valid_key(self):
