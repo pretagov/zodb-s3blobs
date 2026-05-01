@@ -235,7 +235,8 @@ class S3Client:
                     UploadId=upload_id,
                     PartNumberMarker=part_number_marker,
                 )
-                for p in response.get("Parts", []):
+                page_parts = response.get("Parts", []) or []
+                for p in page_parts:
                     parts.append(
                         {
                             "PartNumber": p["PartNumber"],
@@ -245,7 +246,25 @@ class S3Client:
                     )
                 if not response.get("IsTruncated"):
                     break
-                part_number_marker = response["NextPartNumberMarker"]
+                # AWS guarantees NextPartNumberMarker when IsTruncated is
+                # true, but Tigris has been observed returning truncated
+                # responses without it. Fall back to the last part number
+                # on this page (PartNumberMarker is exclusive, so this
+                # works as the cursor for the next request). If neither is
+                # available, bail out to avoid an infinite loop.
+                next_marker = response.get("NextPartNumberMarker")
+                if not next_marker and page_parts:
+                    next_marker = page_parts[-1]["PartNumber"]
+                if not next_marker:
+                    logger.warning(
+                        "S3 list_parts: IsTruncated=true but no marker and "
+                        "no parts on this page (key=%s upload_id=%s); "
+                        "stopping pagination.",
+                        s3_key,
+                        upload_id,
+                    )
+                    break
+                part_number_marker = next_marker
         except ClientError as e:
             self._wrap_client_error(e, "list_parts", s3_key)
         parts.sort(key=lambda p: p["PartNumber"])
