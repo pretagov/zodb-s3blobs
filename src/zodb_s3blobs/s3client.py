@@ -293,6 +293,41 @@ class S3Client:
         )
         return True
 
+    def generate_upload_part_presigned_url(
+        self, s3_key, upload_id, part_number, expires_in=300
+    ):
+        """Return a presigned URL that authorises a single UploadPart PUT.
+
+        The returned URL embeds SigV4 auth in query parameters
+        (``X-Amz-Algorithm``, ``X-Amz-Credential``, ``X-Amz-Date``,
+        ``X-Amz-Expires``, ``X-Amz-Signature``, ``X-Amz-SignedHeaders``),
+        valid for ``expires_in`` seconds. The body content is unrestricted
+        (signed as ``UNSIGNED-PAYLOAD`` by default), so any number of bytes
+        can be PUT — Content-Length is enforced by S3 against the actual
+        request body, not the signature.
+
+        Used by the TUS data-plane offload (nginx auth_request → variable
+        proxy_pass), where Plone signs the URL on a small subrequest and
+        nginx streams the chunk body straight to S3 without the bytes
+        passing through a Zope worker.
+        """
+        full_key = self._full_key(s3_key)
+        try:
+            return self._client.generate_presigned_url(
+                "upload_part",
+                Params={
+                    "Bucket": self.bucket_name,
+                    "Key": full_key,
+                    "UploadId": upload_id,
+                    "PartNumber": part_number,
+                },
+                ExpiresIn=expires_in,
+            )
+        except ClientError as e:
+            self._wrap_client_error(
+                e, "generate_upload_part_presigned_url", s3_key
+            )
+
     def list_parts(self, s3_key, upload_id):
         """Return all parts uploaded so far for a multipart upload.
 
