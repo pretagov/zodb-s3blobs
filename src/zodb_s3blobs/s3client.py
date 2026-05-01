@@ -216,6 +216,83 @@ class S3Client:
         except ClientError as e:
             self._wrap_client_error(e, "abort_multipart_upload", s3_key)
 
+    def ensure_abort_multipart_lifecycle_rule(
+        self, rule_id, prefix, days=7
+    ):
+        """Idempotently ensure a lifecycle rule that auto-aborts abandoned
+        multipart uploads under ``prefix``.
+
+        Reads the bucket's existing lifecycle configuration, returns early if
+        a rule with ``rule_id`` already exists, else merges the new rule with
+        any others and writes the configuration back. The merge step matters:
+        ``PutBucketLifecycleConfiguration`` *replaces* all rules, so blindly
+        writing only our rule would clobber rules other consumers added.
+
+        Returns ``True`` on success (or if the rule was already in place),
+        ``False`` on any error. Errors are logged at WARNING with the manual
+        CLI fix; never raises — callers should not block uploads on this.
+
+        Requires ``s3:GetLifecycleConfiguration`` and
+        ``s3:PutLifecycleConfiguration`` on the IAM principal.
+        """
+        try:
+            response = self._client.get_bucket_lifecycle_configuration(
+                Bucket=self.bucket_name
+            )
+            rules = response.get("Rules", []) or []
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchLifecycleConfiguration", "NoSuchBucketPolicy"):
+                rules = []
+            else:
+                logger.warning(
+                    "S3 lifecycle: cannot read existing config for "
+                    "bucket=%s (%s). Apply rule manually with "
+                    "`aws s3api put-bucket-lifecycle-configuration`.",
+                    self.bucket_name,
+                    code or e,
+                )
+                return False
+
+        if any(r.get("ID") == rule_id for r in rules):
+            return True
+
+        new_rule = {
+            "ID": rule_id,
+            "Status": "Enabled",
+            "Filter": {"Prefix": prefix},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": days},
+            "Expiration": {"Days": days},
+        }
+        rules.append(new_rule)
+
+        try:
+            self._client.put_bucket_lifecycle_configuration(
+                Bucket=self.bucket_name,
+                LifecycleConfiguration={"Rules": rules},
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            logger.warning(
+                "S3 lifecycle: failed to apply rule '%s' to bucket=%s "
+                "(%s). Apply manually with "
+                "`aws s3api put-bucket-lifecycle-configuration`.",
+                rule_id,
+                self.bucket_name,
+                code or e,
+            )
+            return False
+
+        logger.info(
+            "S3 lifecycle: applied rule '%s' to bucket=%s "
+            "(prefix=%s, days=%d)",
+            rule_id,
+            self.bucket_name,
+            prefix,
+            days,
+        )
+        return True
+
     def list_parts(self, s3_key, upload_id):
         """Return all parts uploaded so far for a multipart upload.
 
