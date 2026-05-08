@@ -228,6 +228,58 @@ class S3BlobStorage:
     def temporaryDirectory(self):
         return self._temp_dir
 
+    def loadBlobPath_lazy(self, oid, serial):
+        """Return the local cache path for a committed blob WITHOUT
+        downloading it from S3.
+
+        Used by the patched ``ZODB.Connection.setstate`` to populate
+        ``Blob._p_blob_committed`` cheaply when the blob is unghosted —
+        the bytes are then fetched on demand by ``openCommittedBlobFile``
+        (or by the eager ``loadBlob`` path used by ``Blob.committed()``).
+
+        Skips the S3 ``head_object`` round-trip: setstate fires on every
+        Blob access and we don't want to add latency. A truly missing
+        S3 object will surface later when something opens the file.
+        """
+        # Pending blobs (current txn): real on-disk path.
+        pending = self._pending_blobs.get(oid)
+        if pending is not None and os.path.exists(pending):
+            return pending
+        # Otherwise: prospective cache path (may or may not exist on disk).
+        return self._cache._blob_path(oid, serial)
+
+    def xsendfile_presigned_url(self, oid, serial, expires=60):
+        """Return a presigned S3 GET URL for a committed blob.
+
+        Intended for xsendfile-style proxy hand-off: the caller has the
+        blob's oid/serial (readable from a ghost Persistent without
+        activating it) and wants a URL the front-end proxy can fetch
+        from S3, *without* triggering a download into the local cache.
+
+        Returns None if the blob is not present in S3 (e.g. still
+        pending in the current transaction). Callers that get None
+        should fall back to streaming via Zope.
+        """
+        if oid is None or serial is None:
+            return None
+        # Pending blobs (current txn, not yet uploaded) can't be presigned.
+        if oid in self._pending_blobs or oid in self._pending_blobs_s3:
+            return None
+        key = self._s3_key(oid, serial)
+        full_key = self._s3_client._full_key(key)
+        try:
+            return self._s3_client._client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self._s3_client.bucket_name, 'Key': full_key},
+                ExpiresIn=expires,
+            )
+        except Exception:
+            logger.exception(
+                "xsendfile_presigned_url: failed for oid=%s serial=%s key=%s",
+                _oid_hex(oid), ZODB.utils.tid_repr(serial), full_key,
+            )
+            return None
+
     # -- 2PC hooks --
 
     def tpc_vote(self, transaction):
@@ -553,3 +605,58 @@ def _oid_hex(oid):
 def _tid_hex(tid):
     """Convert tid bytes to hex string."""
     return ZODB.utils.tid_repr(tid).removeprefix("0x").lstrip("0") or "0"
+
+
+# --- ZODB.Connection.setstate patch ---------------------------------------
+#
+# Stock ZODB unghost of a Blob does:
+#     obj._p_blob_committed = self._storage.loadBlob(oid, serial)
+# On S3BlobStorage that downloads the entire object just to populate the
+# attribute — defeating xsendfile and any other code that just wanted to
+# inspect the Blob without reading its bytes. The patch substitutes a
+# lazy variant when the storage exposes one (only S3BlobStorage does);
+# every other storage and every non-Blob object goes through the stock
+# implementation unchanged.
+
+def _patch_connection_setstate():
+    import ZODB.Connection
+    import ZODB.blob
+    if getattr(ZODB.Connection.Connection.setstate,
+               '_s3blobs_patched', False):
+        return
+    _orig_setstate = ZODB.Connection.Connection.setstate
+
+    def setstate(self, obj):
+        if not isinstance(obj, ZODB.blob.Blob):
+            return _orig_setstate(self, obj)
+        lazy = getattr(self._storage, 'loadBlobPath_lazy', None)
+        if lazy is None:
+            return _orig_setstate(self, obj)
+        if self.opened is None:
+            # Let the stock path handle the closed-connection error.
+            return _orig_setstate(self, obj)
+        oid = obj._p_oid
+        p, serial = self._storage.load(oid)
+        self._load_count += 1
+        self._reader.setGhostState(obj, p)
+        obj._p_serial = serial
+        self._cache.update_object_size_estimation(oid, len(p))
+        obj._p_estimated_size = len(p)
+        obj._p_blob_uncommitted = None
+        obj._p_blob_committed = lazy(oid, serial)
+        logger.debug(
+            "setstate: lazy unghost Blob oid=%s serial=%s -> %s "
+            "(no S3 download)",
+            _oid_hex(oid), ZODB.utils.tid_repr(serial),
+            obj._p_blob_committed,
+        )
+
+    setstate._s3blobs_patched = True
+    ZODB.Connection.Connection.setstate = setstate
+    logger.info(
+        "zodb_s3blobs: patched ZODB.Connection.Connection.setstate "
+        "for lazy Blob unghost",
+    )
+
+
+_patch_connection_setstate()
