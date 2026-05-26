@@ -248,13 +248,22 @@ class S3BlobStorage:
         # Otherwise: prospective cache path (may or may not exist on disk).
         return self._cache._blob_path(oid, serial)
 
-    def xsendfile_presigned_url(self, oid, serial, expires=60):
+    def xsendfile_presigned_url(self, oid, serial, expires=60,
+                                content_type=None, filename=None,
+                                disposition='inline'):
         """Return a presigned S3 GET URL for a committed blob.
 
         Intended for xsendfile-style proxy hand-off: the caller has the
         blob's oid/serial (readable from a ghost Persistent without
         activating it) and wants a URL the front-end proxy can fetch
         from S3, *without* triggering a download into the local cache.
+
+        ``content_type``/``filename`` are baked into the presigned URL
+        as ``response-content-type``/``response-content-disposition``
+        query parameters so S3 overrides the object's stored metadata
+        (blobs are uploaded without a Content-Type, so S3 would
+        otherwise return ``binary/octet-stream``). Both params are part
+        of the SigV4 signature, so the proxy cannot tamper with them.
 
         Returns None if the blob is not present in S3 (e.g. still
         pending in the current transaction). Callers that get None
@@ -267,10 +276,18 @@ class S3BlobStorage:
             return None
         key = self._s3_key(oid, serial)
         full_key = self._s3_client._full_key(key)
+        params = {'Bucket': self._s3_client.bucket_name, 'Key': full_key}
+        if content_type:
+            params['ResponseContentType'] = content_type
+        if filename:
+            safe_name = filename.replace('"', '').replace('\\', '')
+            params['ResponseContentDisposition'] = (
+                f'{disposition}; filename="{safe_name}"'
+            )
         try:
             return self._s3_client._client.generate_presigned_url(
                 'get_object',
-                Params={'Bucket': self._s3_client.bucket_name, 'Key': full_key},
+                Params=params,
                 ExpiresIn=expires,
             )
         except Exception:
