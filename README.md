@@ -245,6 +245,172 @@ SSE-C note: if the target bucket is encrypted with SSE-C, the exact same
 customer key bytes must be supplied to both the migration and the runtime
 `<s3blobstorage>` config.
 
+### Purging source blobs after migration
+
+Once the application is running on `<s3blobstorage>` wrapping
+`<relstorage>` and you have confirmed (via `zodb-s3blobs-compare` or the
+audit counts above) that every source blob is present in S3, the blob
+bytes still in Postgres can be reclaimed with `zodb-s3blobs-purge`.
+
+> **WARNING: DESTRUCTIVE AND IRREVERSIBLE.** The purge unlinks the
+> `pg_largeobject` entries referenced by `blob_chunk` and deletes the
+> `blob_chunk` rows themselves. There is no undo. **Take a verified
+> backup before running it** — at minimum a `pg_dump` of the source DB,
+> and ideally a snapshot or versioned copy of the destination S3 bucket
+> as well. If anything in the migration is wrong, you need to be able
+> to restore.
+
+What the purge **removes**:
+
+- Every row in `blob_chunk`.
+- The Postgres large objects (`pg_largeobject` entries) those rows
+  reference, via `lo_unlink`. Without the unlink, deleting `blob_chunk`
+  alone would leave orphaned LOBs taking up space.
+
+What the purge **leaves intact**:
+
+- `object_state` and every other RelStorage table. Object pickles
+  reference blobs by `(zoid, tid)` — the same key the S3 storage uses
+  — so they do not need to change.
+- `temp_blob_chunk`. The purge refuses to run if this table is
+  non-empty, since rows there indicate an in-flight or interrupted
+  commit.
+
+Recommended sequence:
+
+1. Confirm migration parity:
+
+   ```bash
+   psql "$DSN" -c 'SELECT COUNT(DISTINCT (zoid, tid)) FROM blob_chunk;'
+   zodb-s3blobs-migrate --count-only  # (+ --bucket / --endpoint-url / ...)
+   ```
+
+2. Dry-run the purge. This performs the pre-flight `head_object` sweep
+   over every `(zoid, tid)` pair, optionally verifies sizes, and reports
+   how many rows / LOBs would be removed — without modifying the DB:
+
+   ```bash
+   zodb-s3blobs-purge \
+       --dsn "$DSN" \
+       --blob-cache-dir /app/var/relstorage-blobs/relstorage-04 \
+       --verify-size \
+       --dry-run
+   ```
+
+3. Take a backup. Verify it.
+
+4. Run the purge:
+
+   ```bash
+   zodb-s3blobs-purge \
+       --dsn "$DSN" \
+       --blob-cache-dir /app/var/relstorage-blobs/relstorage-04 \
+       --verify-size \
+       --workers 8 \
+       --batch-size 1000
+   ```
+
+   The purge processes `blob_chunk` in batches; each batch is one
+   transaction containing the row delete and the `lo_unlink` calls for
+   the LOBs it released. Interrupting the run leaves the DB in a
+   consistent state: completed batches stay deleted, in-progress
+   batches roll back, and a subsequent run resumes from where it
+   stopped (the pre-flight verify still passes because S3 already has
+   every remaining pair).
+
+5. Reclaim disk. The purge does not VACUUM, because the relevant
+   commands lock heavily. During a maintenance window run:
+
+   ```bash
+   psql "$DSN" -c 'VACUUM (ANALYZE) blob_chunk;'
+   vacuumlo -v "$DSN"            # contrib; sweeps orphaned LOBs
+   # or, for a full rewrite (long-running, takes an ACCESS EXCLUSIVE lock):
+   psql "$DSN" -c 'VACUUM FULL pg_largeobject;'
+   ```
+
+If the pre-flight check finds any `(zoid, tid)` pair missing from S3,
+or — with `--verify-size` — any size mismatch, the purge aborts before
+touching the database and prints a sample of the offending pairs.
+Re-run the migration to copy the missing or corrupted blobs and then
+retry the purge.
+
+### Copying non-blob data to a new Postgres database
+
+As an alternative (or follow-up) to running `zodb-s3blobs-purge` against
+the original DB, you can produce a fresh Postgres database that contains
+every RelStorage table except the blob data using `pg_dump`. This is
+useful when the source DB is large and you'd rather start from a
+freshly-sized instance than rely on `VACUUM FULL` to reclaim space.
+
+Excluding `blob_chunk` and `temp_blob_chunk` on its own is **not**
+sufficient: by default `pg_dump` copies every Postgres large object
+regardless of which tables you exclude, which would leave the
+destination DB with orphaned LOBs in `pg_largeobject` taking up the
+same disk you were trying to free. The dump must also suppress large
+objects with `--no-blobs` (Postgres 13–16) or `--no-large-objects`
+(Postgres 17+; both spellings are accepted on recent versions).
+
+Pre-conditions:
+
+- Migration to S3 has completed and parity has been verified (see the
+  audit and `zodb-s3blobs-compare` steps above).
+- The destination is an **empty** Postgres database. `pg_dump`'s plain
+  output emits `CREATE TABLE` statements, so the schema is created as
+  part of the restore — do not pre-bootstrap it with RelStorage.
+- The application is stopped, or at least not writing to the source
+  RelStorage, for the duration of the dump. A running application can
+  commit between `pg_dump`'s table snapshots and produce an
+  inconsistent target.
+
+Procedure:
+
+```bash
+pg_dump \
+    --exclude-table=blob_chunk \
+    --exclude-table=temp_blob_chunk \
+    --no-blobs \
+    "$SRC_DSN" \
+  | psql "$DEST_DSN"
+```
+
+For very large databases prefer the custom format so the restore can
+be parallelised and resumed:
+
+```bash
+pg_dump \
+    --exclude-table=blob_chunk \
+    --exclude-table=temp_blob_chunk \
+    --no-blobs \
+    --format=custom \
+    --file=relstorage-noblobs.dump \
+    "$SRC_DSN"
+
+pg_restore --dbname="$DEST_DSN" --jobs=4 relstorage-noblobs.dump
+```
+
+What ends up in the destination:
+
+- Every RelStorage table except `blob_chunk` and `temp_blob_chunk`:
+  `object_state`, `current_object`, `transaction`, `object_ref`,
+  `object_refs_added`, `pack_object`, `new_oid`,
+  `commit_row_lock`, and their associated indexes and sequences.
+- Object pickles unchanged. They reference blobs by `(zoid, tid)`,
+  which is the same key the S3-backed storage uses, so no rewriting
+  is required.
+- Sequences are dumped with their current values, so no manual
+  `setval` is needed after the restore.
+
+What is left behind:
+
+- All blob bytes (the LOBs in `pg_largeobject`) and the rows that
+  pointed at them. The destination has no blob data in Postgres; the
+  application reads blobs from S3 via `<s3blobstorage>`.
+
+After the restore, point the application's RelStorage configuration at
+`$DEST_DSN` (still wrapped by `<s3blobstorage>`) and start it. Verify a
+handful of blob-bearing objects open correctly before retiring the
+original database.
+
 ## Development
 
 ```bash
