@@ -10,7 +10,10 @@ import os
 import pytest
 import stat
 import transaction
+import transaction.interfaces
 import ZODB.interfaces
+import ZODB.POSException
+import ZODB.utils
 
 
 @pytest.fixture
@@ -732,3 +735,108 @@ class TestClose:
 
         store.close()
         assert len(close_called) == 1
+
+
+class _Disconnected(Exception):
+    pass
+
+
+class _LoadConnection:
+    def __init__(self):
+        self.dropped = 0
+
+    def drop(self):
+        self.dropped += 1
+
+
+class _FlakyBase(MappingStorage):
+    """MappingStorage with the RelStorage attributes the read retry uses.
+
+    ``failures`` is a list of exceptions raised, in order, by the next reads.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._adapter = type(
+            "Adapter",
+            (),
+            {
+                "driver": type(
+                    "Driver", (), {"disconnected_exceptions": (_Disconnected,)}
+                )()
+            },
+        )()
+        self._load_connection = _LoadConnection()
+        self.failures = []
+
+    def store_record(self, oid=None, data=b"record"):
+        oid = p64(0) if oid is None else oid
+        txn = transaction.Transaction()
+        self.tpc_begin(txn)
+        self.store(oid, ZODB.utils.z64, data, "", txn)
+        self.tpc_vote(txn)
+        self.tpc_finish(txn)
+
+    def _maybe_fail(self):
+        if self.failures:
+            raise self.failures.pop(0)
+
+    def load(self, oid, version=""):
+        self._maybe_fail()
+        return super().load(oid, version)
+
+    def loadBefore(self, oid, tid):
+        self._maybe_fail()
+        return super().loadBefore(oid, tid)
+
+
+class TestReadReconnect:
+    @pytest.fixture
+    def flaky(self):
+        return _FlakyBase()
+
+    @pytest.fixture
+    def flaky_storage(self, flaky, s3_client, blob_cache, tmp_path):
+        storage = S3BlobStorage(
+            flaky, s3_client, blob_cache, temp_dir=str(tmp_path / "staging")
+        )
+        flaky.store_record()
+        return storage
+
+    def test_load_disconnect_is_retryable(self, flaky_storage, flaky):
+        flaky.failures.append(_Disconnected("server closed the connection"))
+        with pytest.raises(ZODB.POSException.ReadConflictError) as info:
+            flaky_storage.load(p64(0))
+        assert isinstance(info.value, transaction.interfaces.TransientError)
+        assert isinstance(info.value.__cause__, _Disconnected)
+        assert flaky._load_connection.dropped == 1
+
+    def test_load_succeeds_after_retry(self, flaky_storage, flaky):
+        flaky.failures.append(_Disconnected("cursor already closed"))
+        with pytest.raises(ZODB.POSException.ReadConflictError):
+            flaky_storage.load(p64(0))
+        data, serial = flaky_storage.load(p64(0))
+        assert (data, serial) == flaky.load(p64(0))
+
+    def test_load_before_disconnect_is_retryable(self, flaky_storage, flaky):
+        flaky.failures.append(_Disconnected("server closed the connection"))
+        with pytest.raises(ZODB.POSException.ReadConflictError):
+            flaky_storage.loadBefore(p64(0), p64(2**62))
+        assert flaky._load_connection.dropped == 1
+
+    def test_other_errors_are_not_retried(self, flaky_storage, flaky):
+        flaky.failures.append(ValueError("not a disconnect"))
+        with pytest.raises(ValueError):
+            flaky_storage.load(p64(0))
+        assert flaky._load_connection.dropped == 0
+
+    def test_missing_object_is_not_retried(self, flaky_storage, flaky):
+        with pytest.raises(ZODB.POSException.POSKeyError):
+            flaky_storage.load(p64(12345))
+        assert flaky._load_connection.dropped == 0
+
+    def test_base_without_adapter_reads_normally(self, storage, base_storage):
+        _FlakyBase.store_record(base_storage)
+        assert storage.load(p64(0)) == base_storage.load(p64(0))
+        with pytest.raises(ZODB.POSException.POSKeyError):
+            storage.load(p64(12345))

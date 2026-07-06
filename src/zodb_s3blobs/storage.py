@@ -128,6 +128,81 @@ class S3BlobStorage:
     def __repr__(self):
         return f"<S3BlobStorage proxy for {self.__storage!r}>"
 
+    # -- Read methods (explicitly defined, shadow the base-storage proxy) --
+    #
+    # These would otherwise proxy straight through __getattr__. They are
+    # defined so a lost database connection on the read path becomes a
+    # retryable ReadConflictError instead of an uncaught 500. See
+    # _read_with_reconnect for the why.
+
+    def load(self, oid, version=""):
+        return self._read_with_reconnect(
+            "load", lambda: self.__storage.load(oid, version)
+        )
+
+    def loadBefore(self, oid, tid):
+        return self._read_with_reconnect(
+            "loadBefore", lambda: self.__storage.loadBefore(oid, tid)
+        )
+
+    def _read_with_reconnect(self, label, call):
+        """Run a base-storage read; turn a DB connection drop into a retryable
+        ReadConflictError so the Zope publisher re-runs the request.
+
+        The base RelStorage's pooled psycopg2 connections die whenever the
+        database goes away under them: a machine resumed from suspend (fly.io
+        ``auto_stop_machines = "suspend"``), a PostgreSQL restart, or a primary
+        failover. The next read then fails mid-load with
+        ``psycopg2.OperationalError: server closed the connection unexpectedly``
+        or ``psycopg2.InterfaceError: cursor already closed``. Left alone, the
+        in-flight request 500s, and a load connection that is never dropped can
+        keep failing on every request until the process restarts: a read-path
+        disconnect is deliberately *not* a TransientError (only RelStorage's
+        commit path has ``StorageDisconnectedDuringCommit``), so ZPublisher's
+        retry loop skips it.
+
+        Here we catch the driver's ``disconnected_exceptions`` (for psycopg2:
+        ``OperationalError`` and ``InterfaceError``), drop the dead load connection so
+        the retry opens a fresh one, and re-raise ``ReadConflictError`` (a
+        TransientError). ZPublisher then aborts the transaction and re-runs the
+        request (``max-conflict-retries``, default 3), where RelStorage
+        reconnects and succeeds. The replay is transaction-safe (nothing was
+        committed and the request body is rewound), exactly as for a
+        ConflictError. It fires *only* on the driver's disconnect signal, never
+        on a generic error, so unrelated failures are never retried.
+
+        Patching here, on the storage wrapper ZODB actually calls ``load`` on,
+        rather than on ``relstorage`` internals, avoids RelStorage's
+        ``copy_storage_methods`` / ``stale_aware`` machinery (which snapshots and
+        swaps the Loader methods per storage instance).
+        """
+        try:
+            return call()
+        except Exception as exc:
+            adapter = getattr(self.__storage, "_adapter", None)
+            driver = getattr(adapter, "driver", None)
+            disconnected = getattr(driver, "disconnected_exceptions", ())
+            if not disconnected or not isinstance(exc, disconnected):
+                # Not a connection drop (a real read error): leave it untouched.
+                raise
+
+            load_connection = getattr(self.__storage, "_load_connection", None)
+            if load_connection is not None:
+                try:
+                    load_connection.drop()
+                except Exception:  # best effort — never mask the original cause
+                    logger.exception("Failed to drop dead RelStorage load connection")
+
+            logger.warning(
+                "Base storage %s lost its database connection (%s); raising "
+                "ReadConflictError so the request is retried",
+                label,
+                exc,
+            )
+            raise ZODB.POSException.ReadConflictError(
+                "Storage load connection lost"
+            ) from exc
+
     # -- Blob methods (explicitly defined, shadow base storage) --
 
     def register_staged_s3_key(self, blob_file_path, staging_key, size):

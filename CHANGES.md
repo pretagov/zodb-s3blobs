@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Retry a request whose read hits a dropped database connection, instead of
+  failing it.
+
 - Add `zodb-s3blobs-migrate` CLI for copying existing blobs from a RelStorage
   Postgres backend into S3. Enumerates `(zoid, tid)` pairs via `blob_chunk`,
   uploads each blob under the same `blobs/{oid_hex}/{tid_hex}.blob` key
