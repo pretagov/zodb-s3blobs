@@ -116,6 +116,12 @@ With a configured prefix: `{prefix}/blobs/{oid_hex}/{tid_hex}.blob`
 
 The local filesystem cache provides fast reads after the first access. It uses LRU eviction with a background daemon thread that removes the oldest files (by access time) when the total size exceeds the configured maximum. The cache is required -- S3 latency makes direct access impractical for ZODB's synchronous access patterns.
 
+### Lazy Blob Loading
+
+Unghosting a `Blob` doesn't download it: ZODB records the blob's path in the local cache, and the data is downloaded when the blob is opened for reading or `Blob.committed()` is called. Code that only inspects a blob, e.g. to serve it from S3 with a presigned URL, doesn't fetch it. This patches `ZODB.Connection.Connection.setstate` and applies when the base storage provides `IMVCCStorage` (e.g. RelStorage).
+
+`Blob.open("r+")` and `Blob.open("a")` copy the committed file directly, so call `Blob.committed()` first if the blob may not be cached.
+
 ### Garbage Collection
 
 During `pack()`, the base storage is packed first, then S3 is scanned for keys referencing OIDs that are no longer reachable. Orphaned keys are deleted. This also cleans up any objects left behind by failed abort operations.

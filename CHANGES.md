@@ -2,6 +2,11 @@
 
 ## 1.1.1 (unreleased)
 
+- Don't download a blob from S3 when a `Blob` is unghosted, only when it is
+  opened for reading or `Blob.committed()` is called. Patches
+  `ZODB.Connection.Connection.setstate`; applies when the base storage
+  provides `IMVCCStorage`.
+
 - Provide `IMVCCStorage` when the base storage does (e.g. RelStorage).
   Previously `ZODB.DB` wrapped `S3BlobStorage` in an `MVCCAdapter`, which
   never polls the base storage for invalidations, so a process didn't see

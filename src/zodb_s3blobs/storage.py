@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import ZODB.blob
+import ZODB.Connection
 import ZODB.interfaces
 import ZODB.POSException
 import ZODB.utils
@@ -59,6 +60,8 @@ class S3BlobStorage:
     Provides IMVCCStorage when the base storage does (e.g. RelStorage).
     """
 
+    _unghosting = False  # set while Connection.setstate loads a Blob
+
     def __init__(self, base_storage, s3_client, cache, temp_dir=None):
         self.__storage = base_storage
         self._s3_client = s3_client
@@ -109,6 +112,11 @@ class S3BlobStorage:
         cached = self._cache.get(oid, serial)
         if cached is not None:
             return cached
+
+        if self._unghosting:
+            # Unghosting only records the path. Blob.open() and
+            # Blob.committed() call loadBlob again, which downloads it.
+            return self._cache._blob_path(oid, serial)
 
         # Download from S3
         key = self._s3_key(oid, serial)
@@ -276,3 +284,34 @@ def _oid_hex(oid):
 def _tid_hex(tid):
     """Convert tid bytes to hex string."""
     return ZODB.utils.tid_repr(tid).removeprefix("0x").lstrip("0") or "0"
+
+
+def _patch_connection_setstate():
+    """Don't download a Blob from S3 when unghosting it.
+
+    ``Connection.setstate`` sets ``Blob._p_blob_committed`` from ``loadBlob()``,
+    which downloads the object. Code that only inspects a Blob, e.g. to hand
+    it to a proxy with a presigned URL, doesn't need its data.
+
+    Only applies to connections whose storage is an ``S3BlobStorage``
+    instance, i.e. when it provides ``IMVCCStorage``; each such instance is
+    used by one connection, so the flag needs no locking.
+    """
+    original = ZODB.Connection.Connection.setstate
+    if original.__module__ == __name__:  # already patched
+        return
+
+    def setstate(self, obj):
+        storage = self._storage
+        if not (isinstance(obj, ZODB.blob.Blob) and isinstance(storage, S3BlobStorage)):
+            return original(self, obj)
+        storage._unghosting = True
+        try:
+            return original(self, obj)
+        finally:
+            storage._unghosting = False
+
+    ZODB.Connection.Connection.setstate = setstate
+
+
+_patch_connection_setstate()
