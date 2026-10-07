@@ -47,6 +47,56 @@ def _ensure_relstorage_lock_early():
 
 _BLOB_KEY_RE = re.compile(r"^blobs/([0-9a-f]+)/[0-9a-f]+\.blob$")
 
+# A blob file holding a marker stands for an object already uploaded to S3,
+# e.g. by a TUS upload handler, which is copied to the blob's key at commit:
+#
+#     S3BLOB-STAGED\n<staging_key>\n<size>\n
+#
+# The marker is recognised by content because savepoints move blob files.
+# Only keys under STAGING_PREFIX are accepted: commit deletes the staging
+# key, and anyone able to store a blob can store a file that looks like a
+# marker.
+STAGING_PREFIX = "tus-staging/"
+_STAGED_MAGIC = b"S3BLOB-STAGED\n"
+_STAGED_MARKER_MAX_BYTES = 4096  # markers are ~70 bytes; don't read real blobs
+
+
+def write_staged_marker(path, staging_key, size):
+    """Write a marker to ``path`` for an object uploaded to ``staging_key``."""
+    if not staging_key.startswith(STAGING_PREFIX):
+        raise ValueError(f"staging key must start with {STAGING_PREFIX!r}")
+    with open(path, "wb") as f:
+        f.write(_STAGED_MAGIC + f"{staging_key}\n{size}\n".encode())
+
+
+def _parse_staged_marker(path):
+    """Return the staging key if ``path`` holds a valid marker, else None."""
+    try:
+        if os.path.getsize(path) > _STAGED_MARKER_MAX_BYTES:
+            return None
+        with open(path, "rb") as f:
+            head = f.read(_STAGED_MARKER_MAX_BYTES)
+    except OSError:
+        return None
+    if not head.startswith(_STAGED_MAGIC):
+        return None
+    try:
+        _magic, staging_key, size, _rest = head.split(b"\n", 3)
+        staging_key = staging_key.decode("utf-8")
+        int(size)
+    except ValueError:  # includes UnicodeDecodeError
+        return None
+    if not staging_key.startswith(STAGING_PREFIX):
+        logger.warning(
+            "Storing blob %s as data: it looks like a staged-upload marker "
+            "but its key %r is not under %r",
+            path,
+            staging_key,
+            STAGING_PREFIX,
+        )
+        return None
+    return staging_key
+
 
 @zope.interface.implementer(ZODB.interfaces.IBlobStorage)
 class S3BlobStorage:
@@ -62,7 +112,9 @@ class S3BlobStorage:
         self._s3_client = s3_client
         self._cache = cache
         self._pending_blobs = {}  # {oid: staged_path}
+        self._pending_blobs_s3 = {}  # {oid: staging_key}
         self._uploaded_keys = []  # [(oid, tid, s3_key)]
+        self._pending_staging_keys = []  # deleted after commit or abort
         self._temp_dir = temp_dir or tempfile.mkdtemp()
         os.makedirs(self._temp_dir, exist_ok=True, mode=0o700)
 
@@ -85,6 +137,12 @@ class S3BlobStorage:
     def storeBlob(self, oid, oldserial, data, blobfilename, version, transaction):
         # Store object data (pickle) in base storage
         self.__storage.store(oid, oldserial, data, "", transaction)
+        staging_key = _parse_staged_marker(blobfilename)
+        if staging_key is not None:
+            self._pending_blobs_s3[oid] = staging_key
+            with contextlib.suppress(OSError):
+                os.remove(blobfilename)
+            return
         # Stage blob locally
         oid_hex = _oid_hex(oid)
         staged_path = os.path.join(self._temp_dir, f"{oid_hex}.blob")
@@ -130,16 +188,21 @@ class S3BlobStorage:
 
     def tpc_vote(self, transaction):
         self.__storage.tpc_vote(transaction)
-        if self._pending_blobs:
+        if self._pending_blobs or self._pending_blobs_s3:
             tid = self._extract_base_tid()
             for oid, staged_path in self._pending_blobs.items():
                 key = self._s3_key(oid, tid)
                 self._s3_client.upload_file(staged_path, key)
                 self._uploaded_keys.append((oid, tid, key))
+            for oid, staging_key in self._pending_blobs_s3.items():
+                final_key = self._s3_key(oid, tid)
+                self._s3_client.copy_object(staging_key, final_key)
+                self._uploaded_keys.append((oid, tid, final_key))
+                self._pending_staging_keys.append(staging_key)
 
     def tpc_finish(self, transaction, func=lambda tid: None):
         tid = self.__storage.tpc_finish(transaction, func)
-        # Move staged files into cache (NO S3 ops - must not fail)
+        # Move staged files into cache (must not fail)
         for oid, staged_path in self._pending_blobs.items():
             try:
                 self._cache.put(oid, tid, staged_path)
@@ -153,7 +216,10 @@ class S3BlobStorage:
             # Clean staged file
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
+        # Blobs copied from a staging key aren't cached until first loaded.
+        self._delete_staging_keys()
         self._pending_blobs = {}
+        self._pending_blobs_s3 = {}
         self._uploaded_keys = []
         return tid
 
@@ -167,12 +233,25 @@ class S3BlobStorage:
                 logger.warning(
                     "Failed to delete S3 key %s during abort", key, exc_info=True
                 )
+        self._delete_staging_keys()
         # Clean staged files
         for _oid, staged_path in self._pending_blobs.items():
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
+        self._pending_blobs_s3 = {}
         self._uploaded_keys = []
+
+    def _delete_staging_keys(self):
+        """Delete the staging keys copied in tpc_vote (best-effort)."""
+        for staging_key in self._pending_staging_keys:
+            try:
+                self._s3_client.delete_object(staging_key)
+            except Exception:
+                logger.warning(
+                    "Failed to delete S3 staging key %s", staging_key, exc_info=True
+                )
+        self._pending_staging_keys = []
 
     # -- MVCC --
 

@@ -2,6 +2,10 @@
 
 ## 1.1.1 (unreleased)
 
+- Commit blobs already uploaded to S3: a blob file holding a marker written by
+  `write_staged_marker()` is committed by copying its staging key, under
+  `tus-staging/`, server-side instead of uploading the file.
+
 - Lower ruff's C901 max-complexity threshold from 15 to 13 as part of the
   ecosystem-wide complexity ratchet. The code base passes as-is.
 

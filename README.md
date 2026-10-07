@@ -101,8 +101,14 @@ transaction commits.
 
 1. **`storeBlob`**: Object data (pickle) is stored in the base storage. The blob file is staged locally.
 2. **`tpc_vote`**: Staged blobs are uploaded to S3. If any upload fails, the transaction aborts cleanly.
-3. **`tpc_finish`**: No S3 operations (this method must not fail per ZODB contract). Staged files are moved into the local cache.
+3. **`tpc_finish`**: Staged files are moved into the local cache. The only S3 operation is the best-effort deletion of staging keys (see below); nothing here may fail, per the ZODB contract.
 4. **`tpc_abort`**: Uploaded S3 objects are deleted (best-effort). Local staged files are cleaned up.
+
+### Blobs Uploaded Directly to S3
+
+An upload handler (e.g. for TUS) can send a file straight to S3 under a key starting with `tus-staging/` (`zodb_s3blobs.storage.STAGING_PREFIX`), then store a blob whose file is a marker written by `zodb_s3blobs.storage.write_staged_marker(path, staging_key, size)`. At `tpc_vote` the staging key is copied server-side to the blob's key instead of uploading the file, and it is deleted after commit or abort. Markers naming keys outside the staging prefix are stored as ordinary blob data.
+
+`S3Client.ensure_abort_multipart_lifecycle_rule()` can add a bucket lifecycle rule that removes abandoned uploads under the staging prefix.
 
 ### S3 Key Layout
 
