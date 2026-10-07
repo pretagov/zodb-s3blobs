@@ -145,6 +145,12 @@ plus a retry backoff of up to one second per botocore retry. Objects larger than
 
 Keep the worst case below any timeout that applies to the whole request. zodb-pgjsonb, for example, holds a PostgreSQL transaction open during the request and terminates it after `idle_in_transaction_session_timeout` (60 seconds by default). A cold-cache download that takes longer in total fails there, whatever the S3 timeouts are. A wall-clock deadline for downloads is tracked in [#26](https://github.com/bluedynamics/zodb-s3blobs/issues/26).
 
+### Lazy Blob Loading
+
+Unghosting a `Blob` doesn't download it: ZODB records the blob's path in the local cache, and the data is downloaded when the blob is opened for reading or `Blob.committed()` is called. Code that only inspects a blob, e.g. to serve it from S3 with a presigned URL, doesn't fetch it. This patches `ZODB.Connection.Connection.setstate` and applies when the base storage provides `IMVCCStorage` (e.g. RelStorage).
+
+`Blob.open("r+")` and `Blob.open("a")` copy the committed file directly, so call `Blob.committed()` first if the blob may not be cached.
+
 ### Garbage Collection
 
 During `pack()`, the base storage is packed first. Then every S3 key whose revision (`oid`, `tid`) the base storage no longer has is deleted: blobs of unreachable objects, of revisions superseded before the pack time, and of aborted transactions whose cleanup failed. History-preserving storages keep the revision current at the pack time and any later ones, so those blobs stay too. Keys newer than the last committed transaction are left alone, as they may belong to a transaction that is still committing.

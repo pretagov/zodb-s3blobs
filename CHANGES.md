@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2 (unreleased)
+
+- Don't download a blob from S3 when a `Blob` is unghosted, only when it is
+  opened for reading or `Blob.committed()` is called. Patches
+  `ZODB.Connection.Connection.setstate`; applies when the base storage
+  provides `IMVCCStorage`.
+
 ## 1.2.1
 
 - Log why blob downloads fail. Every failed attempt on the download client
