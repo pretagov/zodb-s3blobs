@@ -116,6 +116,10 @@ With a configured prefix: `{prefix}/blobs/{oid_hex}/{tid_hex}.blob`
 
 The local filesystem cache provides fast reads after the first access. It uses LRU eviction with a background daemon thread that removes the oldest files (by access time) when the total size exceeds the configured maximum. The cache is required -- S3 latency makes direct access impractical for ZODB's synchronous access patterns.
 
+### Presigned Download URLs
+
+`S3BlobStorage.presigned_url(oid, serial, expires_in=60, content_type=None, filename=None, disposition="inline")` returns a presigned S3 GET URL for a committed blob, so a front-end proxy can serve it from S3 instead of the application streaming it. `content_type` and `filename` set the response's `Content-Type` and `Content-Disposition`, since blobs are stored without metadata. It returns `None` for a blob of the current transaction, with SSE-C (the proxy would need the key) or if signing fails; the caller then serves the blob itself.
+
 ### Garbage Collection
 
 During `pack()`, the base storage is packed first, then S3 is scanned for keys referencing OIDs that are no longer reachable. Orphaned keys are deleted. This also cleans up any objects left behind by failed abort operations.

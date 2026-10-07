@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+import urllib.parse
 import ZODB.blob
 import ZODB.interfaces
 import ZODB.POSException
@@ -125,6 +126,50 @@ class S3BlobStorage:
 
     def temporaryDirectory(self):
         return self._temp_dir
+
+    def presigned_url(
+        self,
+        oid,
+        serial,
+        expires_in=60,
+        content_type=None,
+        filename=None,
+        disposition="inline",
+    ):
+        """Return a presigned S3 GET URL for a committed blob, or None.
+
+        Lets a front-end proxy serve the blob straight from S3. Blobs are
+        stored without metadata, so pass ``content_type`` (S3 would send
+        ``binary/octet-stream``) and ``filename`` for Content-Disposition.
+
+        Returns None, for the caller to serve the blob itself, when there is
+        no committed blob to sign (no oid or serial, or a blob of the current
+        transaction), with SSE-C (the proxy would need the key) or if signing
+        fails.
+        """
+        if oid is None or serial in (None, ZODB.utils.z64):
+            return None
+        if oid in self._pending_blobs or self._s3_client._sse_extra_args:
+            return None
+        content_disposition = None
+        if filename:
+            quoted = urllib.parse.quote(filename)
+            content_disposition = f"{disposition}; filename*=UTF-8''{quoted}"
+        try:
+            return self._s3_client.generate_get_presigned_url(
+                self._s3_key(oid, serial),
+                expires_in=expires_in,
+                content_type=content_type,
+                content_disposition=content_disposition,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to presign S3 URL for oid=%s tid=%s",
+                _oid_hex(oid),
+                _tid_hex(serial),
+                exc_info=True,
+            )
+            return None
 
     # -- 2PC hooks --
 

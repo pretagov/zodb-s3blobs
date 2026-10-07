@@ -2,6 +2,10 @@
 
 ## 1.1.1 (unreleased)
 
+- Add `S3BlobStorage.presigned_url()` and `S3Client.generate_get_presigned_url()`
+  for serving a committed blob straight from S3 (e.g. with an X-Accel-Redirect
+  to a proxy), with optional `Content-Type` and `Content-Disposition`.
+
 - Lower ruff's C901 max-complexity threshold from 15 to 13 as part of the
   ecosystem-wide complexity ratchet. The code base passes as-is.
 
