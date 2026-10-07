@@ -62,6 +62,7 @@ class S3BlobStorage:
         self._s3_client = s3_client
         self._cache = cache
         self._pending_blobs = {}  # {oid: staged_path}
+        self._restored_tids = {}  # {oid: tid} of blobs from restoreBlob
         self._uploaded_keys = []  # [(oid, tid, s3_key)]
         self._temp_dir = temp_dir or tempfile.mkdtemp()
         os.makedirs(self._temp_dir, exist_ok=True, mode=0o700)
@@ -85,9 +86,36 @@ class S3BlobStorage:
     def storeBlob(self, oid, oldserial, data, blobfilename, version, transaction):
         # Store object data (pickle) in base storage
         self.__storage.store(oid, oldserial, data, "", transaction)
-        # Stage blob locally
-        oid_hex = _oid_hex(oid)
-        staged_path = os.path.join(self._temp_dir, f"{oid_hex}.blob")
+        self._stage_blob(oid, blobfilename)
+
+    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
+        # IBlobStorageRestoreable, used when copying transactions in.
+        self.__storage.restore(oid, serial, data, "", prev_txn, transaction)
+        self._stage_blob(oid, blobfilename)
+        # RelStorage's history-free copier restores records with their own
+        # tids in one transaction, so the blob's tid may not be the
+        # transaction's.
+        self._restored_tids[oid] = serial
+
+    def copyTransactionsFrom(self, other):
+        """Copy all transactions from ``other``, uploading blobs to S3 (zodbconvert).
+
+        Requires a RelStorage base. RelStorage's own ``copyTransactionsFrom``
+        would restore blobs into the base storage, bypassing this wrapper, so
+        run its copier with this wrapper as the destination instead.
+        """
+        if not hasattr(self.__storage, "_adapter"):
+            raise NotImplementedError(
+                "copyTransactionsFrom requires a RelStorage base storage"
+            )
+        from relstorage.storage.copy import Copy
+
+        Copy(self, self, self).copyTransactionsFrom(other)
+        self.__storage._adapter.stats.large_database_change()
+
+    def _stage_blob(self, oid, blobfilename):
+        """Move the blob file into the temp dir; tpc_vote uploads it."""
+        staged_path = os.path.join(self._temp_dir, f"{_oid_hex(oid)}.blob")
         shutil.move(blobfilename, staged_path)
         self._pending_blobs[oid] = staged_path
 
@@ -133,7 +161,7 @@ class S3BlobStorage:
         if self._pending_blobs:
             tid = self._extract_base_tid()
             for oid, staged_path in self._pending_blobs.items():
-                key = self._s3_key(oid, tid)
+                key = self._s3_key(oid, self._restored_tids.get(oid, tid))
                 self._s3_client.upload_file(staged_path, key)
                 self._uploaded_keys.append((oid, tid, key))
 
@@ -142,7 +170,7 @@ class S3BlobStorage:
         # Move staged files into cache (NO S3 ops - must not fail)
         for oid, staged_path in self._pending_blobs.items():
             try:
-                self._cache.put(oid, tid, staged_path)
+                self._cache.put(oid, self._restored_tids.get(oid, tid), staged_path)
             except Exception:
                 logger.warning(
                     "Failed to cache blob for oid=%s tid=%s",
@@ -154,6 +182,7 @@ class S3BlobStorage:
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
+        self._restored_tids = {}
         self._uploaded_keys = []
         return tid
 
@@ -172,6 +201,7 @@ class S3BlobStorage:
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
+        self._restored_tids = {}
         self._uploaded_keys = []
 
     # -- MVCC --

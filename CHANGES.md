@@ -2,6 +2,14 @@
 
 ## 1.1.1 (unreleased)
 
+- Support `zodbconvert` into `S3BlobStorage` wrapping RelStorage: add
+  `restoreBlob` and `copyTransactionsFrom`, which runs RelStorage's copier with
+  the wrapper as the destination so blobs are uploaded to S3 under the source's
+  transaction ids. Previously `copyTransactionsFrom` was passed through to
+  RelStorage, which handled the blobs itself instead of uploading them to S3
+  (and failed with `No blob directory is configured` unless given a
+  `blob-dir`).
+
 - Lower ruff's C901 max-complexity threshold from 15 to 13 as part of the
   ecosystem-wide complexity ratchet. The code base passes as-is.
 

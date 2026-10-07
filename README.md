@@ -93,6 +93,32 @@ transaction commits.
 | `cache-dir` | *(required)* | Local cache directory path |
 | `cache-size` | `1GB` | Maximum local cache size |
 
+### Migrating with zodbconvert
+
+`S3BlobStorage` wrapping RelStorage can be the destination of
+`zodbconvert`: blobs are uploaded to S3 as each transaction is copied, keeping
+the source's transaction ids.
+
+```xml
+%import zodb_s3blobs
+
+<filestorage source>
+    path /var/lib/zodb/Data.fs
+    blob-dir /var/lib/zodb/blobs
+</filestorage>
+
+<s3blobstorage destination>
+    bucket-name my-zodb-blobs
+    cache-dir /var/cache/zodb-s3-blobs
+    cache-size 2GB
+    <relstorage>
+        <postgresql>
+            dsn dbname='zodb' user='zodb' host='localhost'
+        </postgresql>
+    </relstorage>
+</s3blobstorage>
+```
+
 ## How It Works
 
 `zodb-s3blobs` uses the same proxy/wrapper pattern as ZODB's built-in `BlobStorage`. It wraps any base storage via `__getattr__` and explicitly overrides all blob methods so they always take precedence.
