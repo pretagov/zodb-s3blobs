@@ -2,6 +2,10 @@
 
 ## 1.1.1 (unreleased)
 
+- Add `S3BlobStorage.presigned_url()` and `S3Client.generate_get_presigned_url()`
+  for serving a committed blob straight from S3 (e.g. with an X-Accel-Redirect
+  to a proxy), with optional `Content-Type` and `Content-Disposition`.
+
 - Don't download a blob from S3 when a `Blob` is unghosted, only when it is
   opened for reading or `Blob.committed()` is called. Patches
   `ZODB.Connection.Connection.setstate`; applies when the base storage

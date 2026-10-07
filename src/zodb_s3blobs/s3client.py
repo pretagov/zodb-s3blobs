@@ -147,6 +147,26 @@ class S3Client:
                 os.unlink(tmp_path)
             raise
 
+    def generate_get_presigned_url(
+        self, s3_key, expires_in=60, content_type=None, content_disposition=None
+    ):
+        """Return a presigned GET URL for ``s3_key``.
+
+        ``content_type`` and ``content_disposition`` override the response's
+        headers. They are part of the signature, so can't be altered.
+        """
+        params = {"Bucket": self.bucket_name, "Key": self._full_key(s3_key)}
+        if content_type:
+            params["ResponseContentType"] = content_type
+        if content_disposition:
+            params["ResponseContentDisposition"] = content_disposition
+        try:
+            return self._client.generate_presigned_url(
+                "get_object", Params=params, ExpiresIn=expires_in
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "generate_get_presigned_url", s3_key)
+
     def delete_object(self, s3_key):
         full_key = self._full_key(s3_key)
         try:

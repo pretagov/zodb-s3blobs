@@ -122,6 +122,10 @@ Unghosting a `Blob` doesn't download it: ZODB records the blob's path in the loc
 
 `Blob.open("r+")` and `Blob.open("a")` copy the committed file directly, so call `Blob.committed()` first if the blob may not be cached.
 
+### Presigned Download URLs
+
+`S3BlobStorage.presigned_url(oid, serial, expires_in=60, content_type=None, filename=None, disposition="inline")` returns a presigned S3 GET URL for a committed blob, so a front-end proxy can serve it from S3 instead of the application streaming it. `content_type` and `filename` set the response's `Content-Type` and `Content-Disposition`, since blobs are stored without metadata. It returns `None` for a blob of the current transaction, with SSE-C (the proxy would need the key) or if signing fails; the caller then serves the blob itself.
+
 ### Garbage Collection
 
 During `pack()`, the base storage is packed first, then S3 is scanned for keys referencing OIDs that are no longer reachable. Orphaned keys are deleted. This also cleans up any objects left behind by failed abort operations.
