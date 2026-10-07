@@ -165,6 +165,234 @@ class S3Client:
                 return None
             self._wrap_client_error(e, "head", s3_key)
 
+    def create_multipart_upload(self, s3_key):
+        full_key = self._full_key(s3_key)
+        try:
+            response = self._client.create_multipart_upload(
+                Bucket=self.bucket_name, Key=full_key, **self._sse_extra_args
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "create_multipart_upload", s3_key)
+        return response["UploadId"]
+
+    def upload_part(self, s3_key, upload_id, part_number, body):
+        full_key = self._full_key(s3_key)
+        try:
+            response = self._client.upload_part(
+                Bucket=self.bucket_name,
+                Key=full_key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=body,
+                **self._sse_extra_args,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "upload_part", s3_key)
+        return response["ETag"]
+
+    def complete_multipart_upload(self, s3_key, upload_id, parts):
+        full_key = self._full_key(s3_key)
+        try:
+            self._client.complete_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=full_key,
+                UploadId=upload_id,
+                MultipartUpload={
+                    "Parts": [
+                        {"PartNumber": p["PartNumber"], "ETag": p["ETag"]}
+                        for p in parts
+                    ]
+                },
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "complete_multipart_upload", s3_key)
+
+    def abort_multipart_upload(self, s3_key, upload_id):
+        full_key = self._full_key(s3_key)
+        try:
+            self._client.abort_multipart_upload(
+                Bucket=self.bucket_name, Key=full_key, UploadId=upload_id
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "abort_multipart_upload", s3_key)
+
+    def ensure_abort_multipart_lifecycle_rule(self, rule_id, prefix, days=7):
+        """Add a lifecycle rule, unless one with ``rule_id`` exists, that
+        aborts multipart uploads and expires objects under ``prefix`` after
+        ``days``.
+
+        Existing rules are kept: the configuration is read and written back
+        whole, as ``PutBucketLifecycleConfiguration`` replaces it. ``prefix``
+        must not cover ``blobs/``, as the rule deletes objects.
+
+        Returns True if the rule is in place, False (logging a warning) if it
+        couldn't be applied; never raises. Needs the
+        ``s3:GetLifecycleConfiguration`` and ``s3:PutLifecycleConfiguration``
+        permissions.
+        """
+        if prefix.startswith("blobs/") or "blobs/".startswith(prefix):
+            logger.warning(
+                "S3 lifecycle: refusing rule %r for prefix %r, which covers blobs/",
+                rule_id,
+                prefix,
+            )
+            return False
+        try:
+            response = self._client.get_bucket_lifecycle_configuration(
+                Bucket=self.bucket_name
+            )
+            rules = response.get("Rules", []) or []
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "NoSuchLifecycleConfiguration":
+                rules = []
+            else:
+                logger.warning(
+                    "S3 lifecycle: cannot read existing config for "
+                    "bucket=%s (%s). Apply rule manually with "
+                    "`aws s3api put-bucket-lifecycle-configuration`.",
+                    self.bucket_name,
+                    code or e,
+                )
+                return False
+
+        if any(r.get("ID") == rule_id for r in rules):
+            return True
+
+        new_rule = {
+            "ID": rule_id,
+            "Status": "Enabled",
+            "Filter": {"Prefix": self._full_key(prefix)},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": days},
+            "Expiration": {"Days": days},
+        }
+        rules.append(new_rule)
+
+        try:
+            self._client.put_bucket_lifecycle_configuration(
+                Bucket=self.bucket_name,
+                LifecycleConfiguration={"Rules": rules},
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            logger.warning(
+                "S3 lifecycle: failed to apply rule '%s' to bucket=%s "
+                "(%s). Apply manually with "
+                "`aws s3api put-bucket-lifecycle-configuration`.",
+                rule_id,
+                self.bucket_name,
+                code or e,
+            )
+            return False
+
+        logger.info(
+            "S3 lifecycle: applied rule '%s' to bucket=%s (prefix=%s, days=%d)",
+            rule_id,
+            self.bucket_name,
+            prefix,
+            days,
+        )
+        return True
+
+    def generate_upload_part_presigned_url(
+        self, s3_key, upload_id, part_number, expires_in=300
+    ):
+        """Return a presigned URL for one UploadPart PUT, valid ``expires_in``
+        seconds.
+
+        Lets a proxy send the part straight to S3. The body isn't signed, so
+        the URL accepts any content. Doesn't work with SSE-C, which needs the
+        key sent with the PUT.
+        """
+        full_key = self._full_key(s3_key)
+        try:
+            return self._client.generate_presigned_url(
+                "upload_part",
+                Params={
+                    "Bucket": self.bucket_name,
+                    "Key": full_key,
+                    "UploadId": upload_id,
+                    "PartNumber": part_number,
+                },
+                ExpiresIn=expires_in,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "generate_upload_part_presigned_url", s3_key)
+
+    def list_parts(self, s3_key, upload_id):
+        """Return all parts uploaded so far for a multipart upload.
+
+        Returns a list of ``{"PartNumber": int, "ETag": str, "Size": int}``,
+        sorted by PartNumber.
+        """
+        full_key = self._full_key(s3_key)
+        parts = []
+        part_number_marker = 0
+        try:
+            while True:
+                response = self._client.list_parts(
+                    Bucket=self.bucket_name,
+                    Key=full_key,
+                    UploadId=upload_id,
+                    PartNumberMarker=part_number_marker,
+                )
+                page_parts = response.get("Parts", []) or []
+                for p in page_parts:
+                    parts.append(
+                        {
+                            "PartNumber": p["PartNumber"],
+                            "ETag": p["ETag"],
+                            "Size": p["Size"],
+                        }
+                    )
+                if not response.get("IsTruncated"):
+                    break
+                # Tigris can omit NextPartNumberMarker from a truncated
+                # response; the last part number works as the (exclusive)
+                # marker. Stop if there is neither, rather than loop.
+                next_marker = response.get("NextPartNumberMarker")
+                if not next_marker and page_parts:
+                    next_marker = page_parts[-1]["PartNumber"]
+                if not next_marker:
+                    logger.warning(
+                        "S3 list_parts: IsTruncated=true but no marker and "
+                        "no parts on this page (key=%s upload_id=%s); "
+                        "stopping pagination.",
+                        s3_key,
+                        upload_id,
+                    )
+                    break
+                part_number_marker = next_marker
+        except ClientError as e:
+            self._wrap_client_error(e, "list_parts", s3_key)
+        parts.sort(key=lambda p: p["PartNumber"])
+        return parts
+
+    def copy_object(self, src_key, dst_key):
+        """Copy ``src_key`` to ``dst_key`` within the bucket, server-side.
+
+        ``client.copy()`` switches to a multipart copy above S3's 5 GiB limit
+        for a single copy.
+        """
+        full_src = self._full_key(src_key)
+        full_dst = self._full_key(dst_key)
+        extra = dict(self._sse_extra_args)
+        if self._sse_extra_args:
+            # The source is encrypted with the same key
+            extra["CopySourceSSECustomerAlgorithm"] = self._sse_extra_args[
+                "SSECustomerAlgorithm"
+            ]
+            extra["CopySourceSSECustomerKey"] = self._sse_extra_args["SSECustomerKey"]
+        try:
+            self._client.copy(
+                CopySource={"Bucket": self.bucket_name, "Key": full_src},
+                Bucket=self.bucket_name,
+                Key=full_dst,
+                ExtraArgs=extra or None,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "copy_object", dst_key)
+
     def list_objects(self, prefix=""):
         full_prefix = self._full_key(prefix) if prefix else self._prefix
         paginator = self._client.get_paginator("list_objects_v2")
