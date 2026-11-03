@@ -235,6 +235,36 @@ class TestMarker:
 
         assert self._read(s3_client, storage._s3_key(p64(1), tid), tmp_path) == content
 
+    @pytest.mark.parametrize(
+        "named_key",
+        [
+            "some/other/object",
+            "tus-staging/../blobs/1/2.blob",
+            "tus-staging/a/b",
+            "tus-staging/",
+            "xtus-staging/abc",
+            " tus-staging/abc",
+        ],
+    )
+    def test_marker_naming_other_key_is_stored_as_data(
+        self, storage, s3_client, tmp_path, named_key
+    ):
+        _seed_staging_object(s3_client, named_key, b"other bytes")
+        forged = tmp_path / "forged.bin"
+        content = b"S3BLOB-STAGED\n" + named_key.encode() + b"\n11\n"
+        forged.write_bytes(content)
+        tid = self._commit(storage, p64(3), str(forged))
+
+        assert self._read(s3_client, named_key, tmp_path) == b"other bytes"
+        assert self._read(s3_client, storage._s3_key(p64(3), tid), tmp_path) == content
+
+    @pytest.mark.parametrize(
+        "key", ["tus-staging/../blobs/1/2.blob", "tus-staging/a/b", "tus-staging/"]
+    )
+    def test_write_staged_marker_rejects_multi_segment_key(self, tmp_path, key):
+        with pytest.raises(ValueError):
+            write_staged_marker(str(tmp_path / "m"), key, 1)
+
     def test_write_staged_marker_rejects_key_outside_prefix(self, tmp_path):
         with pytest.raises(ValueError):
             write_staged_marker(str(tmp_path / "m"), "blobs/1/2.blob", 1)

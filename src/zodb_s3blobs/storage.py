@@ -56,18 +56,24 @@ _OBJECT_STATE_BATCH = 500
 #     S3BLOB-STAGED\n<staging_key>\n<size>\n
 #
 # The marker is recognised by content because savepoints move blob files.
-# Only keys under STAGING_PREFIX are accepted: commit deletes the staging
-# key, and anyone able to store a blob can store a file that looks like a
-# marker.
+# Only a single key segment under STAGING_PREFIX is accepted: commit deletes
+# the staging key, and anyone able to store a blob can store a file that looks
+# like a marker. "/" and "." are refused so a key such as
+# "tus-staging/../blobs/..." can't name anything else on stores that normalise
+# keys.
 STAGING_PREFIX = "tus-staging/"
+_STAGING_KEY_RE = re.compile(r"^tus-staging/[A-Za-z0-9_-]+$")
 _STAGED_MAGIC = b"S3BLOB-STAGED\n"
 _STAGED_MARKER_MAX_BYTES = 4096  # markers are ~70 bytes; don't read real blobs
 
 
 def write_staged_marker(path, staging_key, size):
     """Write a marker to ``path`` for an object uploaded to ``staging_key``."""
-    if not staging_key.startswith(STAGING_PREFIX):
-        raise ValueError(f"staging key must start with {STAGING_PREFIX!r}")
+    if not _STAGING_KEY_RE.match(staging_key):
+        raise ValueError(
+            f"staging key must be a single key under {STAGING_PREFIX!r}, "
+            f"got {staging_key!r}"
+        )
     with open(path, "wb") as f:
         f.write(_STAGED_MAGIC + f"{staging_key}\n{size}\n".encode())
 
@@ -89,10 +95,10 @@ def _parse_staged_marker(path):
         int(size)
     except ValueError:  # includes UnicodeDecodeError
         return None
-    if not staging_key.startswith(STAGING_PREFIX):
+    if not _STAGING_KEY_RE.match(staging_key):
         logger.warning(
             "Storing blob %s as data: it looks like a staged-upload marker "
-            "but its key %r is not under %r",
+            "but its key %r is not a single key under %r",
             path,
             staging_key,
             STAGING_PREFIX,
