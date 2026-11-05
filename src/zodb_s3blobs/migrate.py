@@ -102,6 +102,10 @@ def _materialize_blob(storage, oid, tid, tmp_dir):
     conn, cursor = storage._adapter.connmanager.open_for_load()
     try:
         loids = _fetch_chunk_loids(cursor, oid, tid)
+        if not loids:
+            raise LookupError(
+                f"blob_chunk rows vanished for oid={_oid_hex(oid)} tid={_tid_hex(tid)}"
+            )
         fd, path = tempfile.mkstemp(
             suffix=".blob.tmp", prefix="zs3b-migrate-", dir=tmp_dir
         )
@@ -132,11 +136,16 @@ def blob_size_in_db(storage, oid, tid):
     """Return the sum of LOB lengths for (oid, tid) in ``blob_chunk``.
 
     Used by ``--verify-size`` to catch prior partial uploads whose S3
-    ContentLength does not match the canonical size.
+    ContentLength does not match the canonical size. Raises ``LookupError``
+    if the blob has no rows in ``blob_chunk``, like ``_materialize_blob``.
     """
     conn, cursor = storage._adapter.connmanager.open_for_load()
     try:
         loids = _fetch_chunk_loids(cursor, oid, tid)
+        if not loids:
+            raise LookupError(
+                f"blob_chunk rows vanished for oid={_oid_hex(oid)} tid={_tid_hex(tid)}"
+            )
         total = 0
         for loid in loids:
             lob = conn.lobject(loid, "rb")
