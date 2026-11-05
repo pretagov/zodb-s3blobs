@@ -121,6 +121,9 @@ max-doc-length = 120  # W505 triggers above this
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["T201"]
+# Command-line tools: printing is their output.
+"src/zodb_s3blobs/compare.py" = ["T201"]
+"src/zodb_s3blobs/migrate.py" = ["T201"]
 
 [tool.ty.rules]
 unresolved-import = "ignore"

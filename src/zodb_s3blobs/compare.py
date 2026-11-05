@@ -22,8 +22,6 @@ Each section prints its own counts and (subject to ``--diff-limit``) example
 rows. Exit code is non-zero if any diff is non-empty so it composes with CI.
 """
 
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from zodb_s3blobs.s3client import S3Client
 from zodb_s3blobs.storage import _oid_hex
 from zodb_s3blobs.storage import _tid_hex
@@ -234,7 +232,9 @@ def build_argparser():
         ),
     )
     p.add_argument(
-        "--source-dsn", required=True, help="Postgres DSN for the original RelStorage DB."
+        "--source-dsn",
+        required=True,
+        help="Postgres DSN for the original RelStorage DB.",
     )
     p.add_argument(
         "--dest-dsn",

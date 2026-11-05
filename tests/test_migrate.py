@@ -1,9 +1,9 @@
 from moto import mock_aws
+from ZODB.utils import p64
 from zodb_s3blobs import migrate
 from zodb_s3blobs.s3client import S3Client
 from zodb_s3blobs.storage import _oid_hex
 from zodb_s3blobs.storage import _tid_hex
-from ZODB.utils import p64
 
 import boto3
 import os
@@ -96,9 +96,7 @@ def test_second_run_is_idempotent(s3_client, tmp_path, monkeypatch):
     _install_patches(monkeypatch, storage)
 
     migrate.run_migration(storage, s3_client, workers=1, tmp_dir=str(tmp_path))
-    second = migrate.run_migration(
-        storage, s3_client, workers=1, tmp_dir=str(tmp_path)
-    )
+    second = migrate.run_migration(storage, s3_client, workers=1, tmp_dir=str(tmp_path))
 
     assert second["scanned"] == 1
     assert second["uploaded"] == 0
@@ -134,9 +132,7 @@ def test_dry_run_does_not_upload(s3_client, tmp_path, monkeypatch):
     assert storage.materialize_calls == 0
 
 
-def test_verify_size_detects_mismatch_and_reuploads(
-    s3_client, tmp_path, monkeypatch
-):
+def test_verify_size_detects_mismatch_and_reuploads(s3_client, tmp_path, monkeypatch):
     oid, tid = p64(1), p64(0x100)
     blobs = {(oid, tid): b"full-payload-20bytes"}
     storage = FakeStorage(blobs)
@@ -173,9 +169,7 @@ def test_stale_blob_skipped(s3_client, tmp_path, monkeypatch):
 
     monkeypatch.setattr(migrate, "_materialize_blob", vanishing_materialize)
 
-    counts = migrate.run_migration(
-        storage, s3_client, workers=1, tmp_dir=str(tmp_path)
-    )
+    counts = migrate.run_migration(storage, s3_client, workers=1, tmp_dir=str(tmp_path))
 
     assert counts["stale"] == 1
     assert counts["uploaded"] == 0
@@ -187,20 +181,16 @@ def test_temp_file_removed_after_upload(s3_client, tmp_path, monkeypatch):
     storage = FakeStorage({(oid, tid): b"payload"})
     _install_patches(monkeypatch, storage)
 
-    migrate.run_migration(
-        storage, s3_client, workers=1, tmp_dir=str(tmp_path)
-    )
+    migrate.run_migration(storage, s3_client, workers=1, tmp_dir=str(tmp_path))
 
     # No leftover .blob.tmp files in the tmp dir.
-    remaining = [
-        f for f in os.listdir(str(tmp_path)) if f.endswith(".blob.tmp")
-    ]
+    remaining = [f for f in os.listdir(str(tmp_path)) if f.endswith(".blob.tmp")]
     assert remaining == []
 
 
 def test_key_format_regression(tmp_path):
     """Pins the S3 key format so _oid_hex / _tid_hex can't drift silently."""
-    assert migrate.s3_key_for(p64(1), p64(0x40875bfa5cccf11)) == (
+    assert migrate.s3_key_for(p64(1), p64(0x40875BFA5CCCF11)) == (
         "blobs/1/40875bfa5cccf11.blob"
     )
     assert migrate.s3_key_for(p64(0), p64(0)) == "blobs/0/0.blob"
@@ -220,6 +210,4 @@ def test_failed_upload_raises(s3_client, tmp_path, monkeypatch):
     monkeypatch.setattr(s3_client, "upload_file", boom)
 
     with pytest.raises(RuntimeError, match="migration had 1 failures"):
-        migrate.run_migration(
-            storage, s3_client, workers=1, tmp_dir=str(tmp_path)
-        )
+        migrate.run_migration(storage, s3_client, workers=1, tmp_dir=str(tmp_path))

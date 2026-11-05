@@ -26,9 +26,9 @@ Going around RelStorage's own ``loadBlob`` is deliberate. Two reasons:
    file sidesteps that race entirely.
 """
 
+from concurrent.futures import as_completed
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from concurrent.futures import wait
 from zodb_s3blobs.s3client import S3Client
 from zodb_s3blobs.storage import _oid_hex
@@ -85,8 +85,7 @@ def _fetch_chunk_loids(cursor, oid, tid):
     (zoid, tid); older installs may have multiple.
     """
     cursor.execute(
-        "SELECT chunk FROM blob_chunk "
-        "WHERE zoid = %s AND tid = %s ORDER BY chunk_num",
+        "SELECT chunk FROM blob_chunk WHERE zoid = %s AND tid = %s ORDER BY chunk_num",
         (ZODB.utils.u64(oid), ZODB.utils.u64(tid)),
     )
     return [row[0] for row in cursor.fetchall()]
@@ -103,11 +102,6 @@ def _materialize_blob(storage, oid, tid, tmp_dir):
     conn, cursor = storage._adapter.connmanager.open_for_load()
     try:
         loids = _fetch_chunk_loids(cursor, oid, tid)
-        if not loids:
-            raise LookupError(
-                f"blob_chunk rows vanished for oid={_oid_hex(oid)} "
-                f"tid={_tid_hex(tid)}"
-            )
         fd, path = tempfile.mkstemp(
             suffix=".blob.tmp", prefix="zs3b-migrate-", dir=tmp_dir
         )
@@ -324,7 +318,7 @@ def run_migration(
 def _record(fut, counts, failures):
     try:
         status, size = fut.result()
-    except Exception as exc:  # noqa: BLE001 — we want to record any failure
+    except Exception as exc:  # record any failure
         counts["failed"] += 1
         # We don't have the (oid, tid) handy here; rely on upload_one's
         # DEBUG log plus the exception text for correlation.
@@ -402,7 +396,10 @@ def _augment_dsn_with_keepalives(dsn, *, keepalives, idle, interval, count):
     }
 
     if dsn.startswith(("postgres://", "postgresql://")):
-        from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+        from urllib.parse import parse_qsl
+        from urllib.parse import urlencode
+        from urllib.parse import urlparse
+        from urllib.parse import urlunparse
 
         parsed = urlparse(dsn)
         existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -410,12 +407,8 @@ def _augment_dsn_with_keepalives(dsn, *, keepalives, idle, interval, count):
             existing.setdefault(k, v)
         return urlunparse(parsed._replace(query=urlencode(existing)))
 
-    existing_keys = {
-        token.split("=", 1)[0] for token in dsn.split() if "=" in token
-    }
-    suffix = " ".join(
-        f"{k}={v}" for k, v in params.items() if k not in existing_keys
-    )
+    existing_keys = {token.split("=", 1)[0] for token in dsn.split() if "=" in token}
+    suffix = " ".join(f"{k}={v}" for k, v in params.items() if k not in existing_keys)
     if not suffix:
         return dsn
     sep = "" if dsn.endswith(" ") or not dsn else " "
@@ -450,7 +443,7 @@ def build_argparser():
         "--dsn",
         default=_env("RELSTORAGE_DSN"),
         help="Postgres DSN for the source RelStorage (env RELSTORAGE_DSN). "
-        "Example: \"host=... port=... dbname=... user=... password=...\"",
+        'Example: "host=... port=... dbname=... user=... password=..."',
     )
     p.add_argument(
         "--blob-cache-dir",
