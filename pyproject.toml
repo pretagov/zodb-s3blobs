@@ -119,5 +119,5 @@ max-doc-length = 120  # W505 triggers above this
 "tests/*" = ["T201"]
 
 [tool.ty.rules]
-unresolved-import = "ignore"
+import-not-found = "ignore"
 unsupported-base = "ignore"
