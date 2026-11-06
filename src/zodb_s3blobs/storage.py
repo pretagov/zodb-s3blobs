@@ -219,7 +219,7 @@ class S3BlobStorage:
 
     def tpc_finish(self, transaction, func=lambda tid: None):
         tid = self.__storage.tpc_finish(transaction, func)
-        # Move staged files into cache (must not fail)
+        # Move staged files into cache (NO S3 ops - must not fail)
         for oid, staged_path in self._pending_blobs.items():
             try:
                 self._cache.put(oid, tid, staged_path)
@@ -233,11 +233,10 @@ class S3BlobStorage:
             # Clean staged file
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
-        # Blobs copied from a staging key aren't cached until first loaded.
-        self._delete_staging_keys()
         self._pending_blobs = {}
-        self._pending_blobs_s3 = {}
         self._uploaded_keys = []
+        self._pending_blobs_s3 = {}
+        self._delete_staging_keys()
         return tid
 
     def tpc_abort(self, transaction):
@@ -250,14 +249,14 @@ class S3BlobStorage:
                 logger.warning(
                     "Failed to delete S3 key %s during abort", key, exc_info=True
                 )
-        self._delete_staging_keys()
         # Clean staged files
         for _oid, staged_path in self._pending_blobs.items():
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
-        self._pending_blobs_s3 = {}
         self._uploaded_keys = []
+        self._pending_blobs_s3 = {}
+        self._delete_staging_keys()
 
     def _delete_staging_keys(self):
         """Delete the staging keys copied in tpc_vote (best-effort)."""
