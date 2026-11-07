@@ -156,6 +156,52 @@ class TestCopyObject:
         with pytest.raises(S3OperationError):
             s3_client.copy_object("tus-staging/missing", "blobs/1/2.blob")
 
+    def _record_operations(self, s3_client):
+        operations = []
+
+        def record(model, **kwargs):
+            operations.append(model.name)
+
+        s3_client._client.meta.events.register("before-call.s3", record)
+        return operations
+
+    def test_single_copy_below_threshold(self, s3_client, tmp_path):
+        # Larger than boto3's default 8 MiB multipart threshold. Without the
+        # client's transfer config this becomes parallel UploadPartCopy calls.
+        data = b"y" * (9 * 1024 * 1024)
+        source = tmp_path / "source"
+        source.write_bytes(data)
+        s3_client.upload_file(str(source), "tus-staging/a")
+        operations = self._record_operations(s3_client)
+
+        s3_client.copy_object("tus-staging/a", "blobs/1/2.blob")
+
+        assert "CopyObject" in operations
+        assert "UploadPartCopy" not in operations
+        assert _read(s3_client, "blobs/1/2.blob", tmp_path) == data
+
+    def test_multipart_copy_above_threshold(self, tmp_path):
+        with mock_aws():
+            boto3.client("s3", region_name="us-east-1").create_bucket(
+                Bucket="test-bucket"
+            )
+            s3_client = S3Client(
+                bucket_name="test-bucket",
+                region_name="us-east-1",
+                multipart_threshold=5 * 1024 * 1024,
+            )
+            data = PART * 2 + b"z"
+            source = tmp_path / "source"
+            source.write_bytes(data)
+            s3_client.upload_file(str(source), "tus-staging/a")
+            operations = self._record_operations(s3_client)
+
+            s3_client.copy_object("tus-staging/a", "blobs/1/2.blob")
+
+            assert "CopyObject" not in operations
+            assert operations.count("UploadPartCopy") >= 2
+            assert _read(s3_client, "blobs/1/2.blob", tmp_path) == data
+
 
 class TestLifecycleRule:
     def _rules(self, s3_client):

@@ -439,8 +439,11 @@ class S3Client:
     def copy_object(self, src_key, dst_key):
         """Copy ``src_key`` to ``dst_key`` within the bucket, server-side.
 
-        ``client.copy()`` switches to a multipart copy above S3's 5 GiB limit
-        for a single copy.
+        Uses the same transfer config as uploads: a single CopyObject up to
+        ``multipart_threshold`` (default 5 GiB, S3's limit for a single copy),
+        and a multipart copy with ``s3_max_concurrency`` threads above it.
+        boto3's own defaults would split anything over 8 MiB into parallel
+        UploadPartCopy requests.
         """
         full_src = self._full_key(src_key)
         full_dst = self._full_key(dst_key)
@@ -457,6 +460,7 @@ class S3Client:
                 Bucket=self.bucket_name,
                 Key=full_dst,
                 ExtraArgs=extra or None,
+                Config=self._transfer_config,
             )
         except ClientError as e:
             self._wrap_client_error(e, "copy_object", dst_key)
