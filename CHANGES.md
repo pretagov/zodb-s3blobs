@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 (unreleased)
+
+- Commit blobs already uploaded to S3: a blob file holding a marker written by
+  `write_staged_marker()` is committed by copying its staging key, a single
+  key under `tus-staging/`, server-side instead of uploading the file.
+
 ## 1.2.1
 
 - Log why blob downloads fail. Every failed attempt on the download client
