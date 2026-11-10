@@ -465,6 +465,20 @@ class S3Client:
         except ClientError as e:
             self._wrap_client_error(e, "copy_object", dst_key)
 
+    def list_multipart_uploads(self, prefix=""):
+        """Yield ``(key, upload_id)`` for multipart uploads in progress under
+        ``prefix``. Keys are relative to the client's prefix, as with
+        ``list_objects``."""
+        full_prefix = self._full_key(prefix) if prefix else self._prefix
+        paginator = self._client.get_paginator("list_multipart_uploads")
+        prefix_len = len(self._prefix) + 1 if self._prefix else 0
+        try:
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=full_prefix):
+                for upload in page.get("Uploads", []) or []:
+                    yield upload["Key"][prefix_len:], upload["UploadId"]
+        except ClientError as e:
+            self._wrap_client_error(e, "list_multipart_uploads", prefix)
+
     def list_objects(self, prefix=""):
         full_prefix = self._full_key(prefix) if prefix else self._prefix
         paginator = self._client.get_paginator("list_objects_v2")

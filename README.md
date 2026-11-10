@@ -122,6 +122,21 @@ An upload handler (e.g. for TUS) can send a file straight to S3 under a key star
 
 `S3Client.ensure_abort_multipart_lifecycle_rule()` can add a bucket lifecycle rule that removes abandoned uploads under the staging prefix.
 
+### Reserved Blobs
+
+A staged upload is copied at `tpc_vote`, so committing a large upload takes as long as a server-side copy of the whole file, and the base storage's commit locks are held meanwhile. Above `multipart_threshold` (5 GiB) the copy is a multipart copy of many requests.
+
+A reserved blob avoids the copy: it is committed first, without data, and the data is then uploaded straight to its final key.
+
+1. `zodb_s3blobs.storage.reserve_blob()` returns a new blob. Commit it reachable from a persistent object, e.g. the record of the upload in progress. Nothing is uploaded.
+2. `committed_blob_key(blob)` returns the blob's key, `blobs/<oid>/<tid>.blob`, without loading the blob.
+3. Upload the data to that key, e.g. as a multipart upload with the `S3Client` methods. Its parts can be the upload's own chunks.
+4. In the transaction that finishes the upload, reference the blob from its final place, e.g. a file field, and drop the upload record's reference. The blob isn't stored again, so this commit takes no time whatever the file's size.
+
+Until the key exists, loading the blob raises `POSKeyError`, so don't load it (or anything that opens it) before the upload completes. Keep the blob reachable throughout: then `pack()` keeps it however recent the pack time. A reservation that is never linked becomes unreachable once its upload record is removed, and the next `pack()` removes it with its key, or aborts its multipart upload if that was never completed.
+
+The reservation is recognised by the blob file's content, exactly the 16 bytes `S3BLOB-RESERVED\n`. A blob with that content stored any other way is also treated as a reservation and has no data. Other blob storages store the marker as the blob's data.
+
 ### S3 Key Layout
 
 ```
@@ -153,7 +168,7 @@ Keep the worst case below any timeout that applies to the whole request. zodb-pg
 
 ### Garbage Collection
 
-During `pack()`, the base storage is packed first. Then every S3 key whose revision (`oid`, `tid`) the base storage no longer has is deleted: blobs of unreachable objects, of revisions superseded before the pack time, and of aborted transactions whose cleanup failed. History-preserving storages keep the revision current at the pack time and any later ones, so those blobs stay too. Keys newer than the last committed transaction are left alone, as they may belong to a transaction that is still committing.
+During `pack()`, the base storage is packed first. Then every S3 key whose revision (`oid`, `tid`) the base storage no longer has is deleted: blobs of unreachable objects, of revisions superseded before the pack time, and of aborted transactions whose cleanup failed. History-preserving storages keep the revision current at the pack time and any later ones, so those blobs stay too. Keys newer than the last committed transaction are left alone, as they may belong to a transaction that is still committing. Multipart uploads in progress on blob keys are aborted on the same terms, so an upload to a reserved blob that was garbage collected doesn't keep its parts. Listing them needs `s3:ListBucketMultipartUploads`; if that fails, a warning is logged and the pack carries on.
 
 Versions before 1.2.0 never deleted the blobs of superseded revisions, so the first `pack()` after upgrading can delete a large number of S3 objects at once. Enable bucket versioning or take a backup before that first pack if you want a way back.
 
