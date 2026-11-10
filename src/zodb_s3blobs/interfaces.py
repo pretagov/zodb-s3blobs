@@ -31,6 +31,9 @@ class IS3Client(Interface):
     def abort_multipart_upload(s3_key, upload_id):
         """Abort a multipart upload and discard any uploaded parts."""
 
+    def list_multipart_uploads(prefix):
+        """Yield (s3_key, upload_id) for multipart uploads in progress under prefix."""
+
     def copy_object(src_key, dst_key):
         """Server-side copy of one S3 object to another key in the same bucket."""
 

@@ -107,6 +107,61 @@ def _parse_staged_marker(path):
     return staging_key
 
 
+# A blob file holding exactly this marker is a reservation: the revision is
+# committed without uploading anything, so that the caller learns the blob's
+# final key (which contains the commit's tid) and can upload the data there
+# afterwards. See ``reserve_blob()``.
+_RESERVED_MAGIC = b"S3BLOB-RESERVED\n"
+
+
+def reserve_blob():
+    """Return a new blob that is committed without data.
+
+    Commit it reachable from a persistent object (e.g. the record of the
+    upload in progress), then call ``committed_blob_key()`` to get the key to
+    upload the data to. Until that key exists, loading the blob raises
+    ``POSKeyError``. Only ``S3BlobStorage`` recognises the reservation; any
+    other blob storage would store the marker as the blob's data.
+    """
+    blob = ZODB.blob.Blob()
+    with blob.open("w") as f:
+        f.write(_RESERVED_MAGIC)
+    return blob
+
+
+def committed_blob_key(blob):
+    """Return the S3 key of ``blob``'s committed revision, without loading it.
+
+    ``blob`` must have been committed. The key is relative to the storage's
+    ``s3-prefix``, as the ``S3Client`` methods expect. The blob itself stays a
+    ghost: loading it would fetch its data, which a reserved blob doesn't have
+    until it's uploaded.
+    """
+    jar = blob._p_jar
+    oid = blob._p_oid
+    if jar is None or oid is None:
+        raise ValueError("blob has not been committed")
+    # The connection turns a committed blob into a ghost and resets its
+    # _p_serial, so ask the storage for the revision instead.
+    _data, serial = jar._storage.load(oid)
+    return blob_key(oid, serial)
+
+
+def blob_key(oid, tid):
+    """Return the S3 key of revision ``tid`` of blob ``oid`` (both bytes)."""
+    return f"blobs/{_oid_hex(oid)}/{_tid_hex(tid)}.blob"
+
+
+def _is_reserved_marker(path):
+    try:
+        if os.path.getsize(path) != len(_RESERVED_MAGIC):
+            return False
+        with open(path, "rb") as f:
+            return f.read() == _RESERVED_MAGIC
+    except OSError:
+        return False
+
+
 @zope.interface.implementer(ZODB.interfaces.IBlobStorage)
 class S3BlobStorage:
     """ZODB storage wrapper that redirects blob operations to S3.
@@ -154,6 +209,11 @@ class S3BlobStorage:
     def storeBlob(self, oid, oldserial, data, blobfilename, version, transaction):
         # Store object data (pickle) in base storage
         self.__storage.store(oid, oldserial, data, "", transaction)
+        if _is_reserved_marker(blobfilename):
+            # Nothing to upload: the data goes to the blob's key after commit.
+            with contextlib.suppress(OSError):
+                os.remove(blobfilename)
+            return
         staging_key = _parse_staged_marker(blobfilename)
         if staging_key is not None:
             self._pending_blobs_s3[oid] = staging_key
@@ -309,7 +369,9 @@ class S3BlobStorage:
             # leave keys newer than the last committed transaction alone.
             last_tid = ZODB.utils.u64(view.lastTransaction())
             keys_by_oid = self._blob_keys_by_oid(last_tid)
-            live = self._live_revisions(view, keys_by_oid)
+            uploads_by_oid = self._blob_uploads_by_oid(last_tid)
+            live = self._live_revisions(view, set(keys_by_oid) | set(uploads_by_oid))
+        self._abort_dead_uploads(uploads_by_oid, live)
         deleted = 0
         for oid, keys in keys_by_oid.items():
             live_tids = live.get(oid, ())
@@ -354,6 +416,56 @@ class S3BlobStorage:
             if tid <= max_tid:
                 keys_by_oid[oid].append((tid, key))
         return keys_by_oid
+
+    def _blob_uploads_by_oid(self, max_tid):
+        """Return ``{oid: [(tid, key, upload_id), ...]}`` for multipart uploads
+        in progress on blob keys with ``tid <= max_tid``.
+
+        These are uploads to reserved blobs. Returns ``{}``, logging a warning,
+        if the uploads can't be listed.
+        """
+        uploads_by_oid = collections.defaultdict(list)
+        try:
+            for key, upload_id in self._s3_client.list_multipart_uploads("blobs/"):
+                revision = self._revision_from_key(key)
+                if revision is None:
+                    continue
+                oid, tid = revision
+                if tid <= max_tid:
+                    uploads_by_oid[oid].append((tid, key, upload_id))
+        except Exception:
+            logger.warning(
+                "GC: failed to list multipart uploads under blobs/", exc_info=True
+            )
+            return {}
+        return uploads_by_oid
+
+    def _abort_dead_uploads(self, uploads_by_oid, live):
+        """Abort uploads to blob revisions the base storage no longer has.
+
+        A reserved blob stays live while it's reachable, so an upload still in
+        progress is never touched; once its reservation is garbage collected,
+        the upload can't be committed any more.
+        """
+        aborted = 0
+        for oid, uploads in uploads_by_oid.items():
+            live_tids = live.get(oid, ())
+            for tid, key, upload_id in uploads:
+                if tid in live_tids:
+                    continue
+                logger.info("GC: aborting multipart upload %s to %s", upload_id, key)
+                try:
+                    self._s3_client.abort_multipart_upload(key, upload_id)
+                    aborted += 1
+                except Exception:
+                    logger.warning(
+                        "GC: failed to abort multipart upload %s to %s",
+                        upload_id,
+                        key,
+                        exc_info=True,
+                    )
+        if uploads_by_oid:
+            logger.info("GC: aborted %d multipart uploads", aborted)
 
     def _live_revisions(self, view, oids):
         """Return ``{oid: {tid, ...}}`` of the revisions the base storage has."""
@@ -442,7 +554,7 @@ class S3BlobStorage:
         )
 
     def _s3_key(self, oid, tid):
-        return f"blobs/{_oid_hex(oid)}/{_tid_hex(tid)}.blob"
+        return blob_key(oid, tid)
 
 
 def _oid_hex(oid):

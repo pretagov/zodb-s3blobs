@@ -6,6 +6,13 @@
   `write_staged_marker()` is committed by copying its staging key, a single
   key under `tus-staging/`, server-side instead of uploading the file.
 
+- Reserved blobs: `reserve_blob()` returns a blob that is committed without
+  data, and `committed_blob_key()` gives its key, so that the data can be
+  uploaded straight to the final key after the commit. Finishing such an
+  upload stores and copies nothing. `pack()` aborts multipart uploads on blob
+  keys whose revision the base storage no longer has, and
+  `S3Client.list_multipart_uploads()` is new.
+
 ## 1.2.1
 
 - Log why blob downloads fail. Every failed attempt on the download client
