@@ -3,6 +3,7 @@ from botocore.exceptions import ReadTimeoutError
 from moto import mock_aws
 from zodb_s3blobs.interfaces import IS3Client
 from zodb_s3blobs.s3client import S3Client
+from zodb_s3blobs.s3client import S3OperationError
 
 import base64
 import boto3
@@ -107,6 +108,36 @@ class TestHeadObject:
         assert result is None
 
 
+class TestCopyObject:
+    def test_copy_object(self, client, tmp_path):
+        src = tmp_path / "source.bin"
+        src.write_bytes(b"copy me")
+        client.upload_file(str(src), "blobs/1/a.blob")
+
+        client.copy_object("blobs/1/a.blob", "blobs/1/b.blob")
+
+        dst = tmp_path / "copy.bin"
+        client.download_file("blobs/1/b.blob", str(dst))
+        assert dst.read_bytes() == b"copy me"
+        assert client.head_object("blobs/1/a.blob") is not None
+
+    def test_copy_object_with_prefix(self, prefixed_client, tmp_path):
+        src = tmp_path / "source.bin"
+        src.write_bytes(b"copy me")
+        prefixed_client.upload_file(str(src), "blobs/1/a.blob")
+
+        prefixed_client.copy_object("blobs/1/a.blob", "blobs/1/b.blob")
+
+        s3 = boto3.client("s3", region_name="us-east-1")
+        resp = s3.list_objects_v2(Bucket="test-bucket", Prefix="myprefix/")
+        keys = {obj["Key"] for obj in resp.get("Contents", [])}
+        assert keys == {"myprefix/blobs/1/a.blob", "myprefix/blobs/1/b.blob"}
+
+    def test_copy_missing_object_raises(self, client):
+        with pytest.raises(S3OperationError):
+            client.copy_object("blobs/1/missing.blob", "blobs/1/b.blob")
+
+
 class TestListObjects:
     def test_list_objects(self, client, tmp_path):
         src = tmp_path / "list.bin"
@@ -208,6 +239,17 @@ class TestSSEC:
 
         sse_client.delete_object("enc/del.blob")
         assert sse_client.head_object("enc/del.blob") is None
+
+    def test_copy_object(self, sse_client, tmp_path):
+        src = tmp_path / "copy_enc.bin"
+        src.write_bytes(b"copy test enc")
+        sse_client.upload_file(str(src), "enc/a.blob")
+
+        sse_client.copy_object("enc/a.blob", "enc/b.blob")
+
+        dst = tmp_path / "copied.bin"
+        sse_client.download_file("enc/b.blob", str(dst))
+        assert dst.read_bytes() == b"copy test enc"
 
     def test_list_objects(self, sse_client, tmp_path):
         src = tmp_path / "list_enc.bin"
