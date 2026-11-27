@@ -1,3 +1,4 @@
+import base64
 import collections
 import contextlib
 import logging
@@ -67,6 +68,7 @@ class S3BlobStorage:
         self._s3_client = s3_client
         self._cache = cache
         self._pending_blobs = {}  # {oid: staged_path}
+        self._pending_undo = {}  # {oid: s3_key of the revision restored}
         self._uploaded_keys = []  # [(oid, tid, s3_key)]
         self._temp_dir = temp_dir or tempfile.mkdtemp()
         os.makedirs(self._temp_dir, exist_ok=True, mode=0o700)
@@ -137,15 +139,68 @@ class S3BlobStorage:
     def temporaryDirectory(self):
         return self._temp_dir
 
+    # -- Undo --
+
+    def undo(self, transaction_id, transaction):
+        """Undo a transaction, carrying its blobs' previous revisions forward.
+
+        The base storage writes the state each object had before the undone
+        transaction again, under this transaction's id. A blob's state is
+        only usable with its data, so the blob of the revision being
+        restored is copied, server-side, to this transaction's key in
+        ``tpc_vote``, where an aborted commit removes it again.
+        """
+        result = self.__storage.undo(transaction_id, transaction)
+        undone_tid = base64.decodebytes(transaction_id + b"\n")
+        for oid in self._blob_oids_in_transaction(undone_tid):
+            previous = self.__storage.loadBefore(oid, undone_tid)
+            if previous is None:
+                # Created by the undone transaction, so the undo removes it.
+                self._pending_undo.pop(oid, None)
+                continue
+            data, serial, _end = previous
+            if not ZODB.blob.is_blob_record(data):
+                continue
+            source_key = self._s3_key(oid, serial)
+            if self._s3_client.head_object(source_key) is None:
+                raise ZODB.POSException.UndoError(
+                    f"the blob of revision {_tid_hex(serial)} is missing "
+                    f"from S3 ({source_key})",
+                    oid,
+                )
+            self._pending_undo[oid] = source_key
+        return result
+
+    def _blob_oids_in_transaction(self, tid):
+        """Return the oids of the blobs that transaction ``tid`` wrote."""
+        oids = []
+        records = self.__storage.iterator(tid, tid)
+        try:
+            for txn in records:
+                if txn.tid != tid:
+                    continue
+                for record in txn:
+                    if ZODB.blob.is_blob_record(record.data):
+                        oids.append(record.oid)
+        finally:
+            close = getattr(records, "close", None)
+            if close is not None:
+                close()
+        return oids
+
     # -- 2PC hooks --
 
     def tpc_vote(self, transaction):
         self.__storage.tpc_vote(transaction)
-        if self._pending_blobs:
+        if self._pending_blobs or self._pending_undo:
             tid = self._extract_base_tid()
             for oid, staged_path in self._pending_blobs.items():
                 key = self._s3_key(oid, tid)
                 self._s3_client.upload_file(staged_path, key)
+                self._uploaded_keys.append((oid, tid, key))
+            for oid, source_key in self._pending_undo.items():
+                key = self._s3_key(oid, tid)
+                self._s3_client.copy_object(source_key, key)
                 self._uploaded_keys.append((oid, tid, key))
 
     def tpc_finish(self, transaction, func=lambda tid: None):
@@ -165,6 +220,7 @@ class S3BlobStorage:
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
+        self._pending_undo = {}
         self._uploaded_keys = []
         return tid
 
@@ -183,6 +239,7 @@ class S3BlobStorage:
             with contextlib.suppress(OSError):
                 os.remove(staged_path)
         self._pending_blobs = {}
+        self._pending_undo = {}
         self._uploaded_keys = []
 
     # -- MVCC --

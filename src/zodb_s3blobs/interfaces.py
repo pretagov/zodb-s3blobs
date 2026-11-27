@@ -16,6 +16,9 @@ class IS3Client(Interface):
     def head_object(s3_key):
         """Return metadata dict for an S3 object, or None if not found."""
 
+    def copy_object(src_key, dst_key):
+        """Copy an S3 object to another key in the same bucket, server-side."""
+
     def list_objects(prefix):
         """Yield S3 keys matching the given prefix."""
 

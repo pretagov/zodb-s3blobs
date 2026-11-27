@@ -233,6 +233,35 @@ class S3Client:
                 return None
             self._wrap_client_error(e, "head", s3_key)
 
+    def copy_object(self, src_key, dst_key):
+        """Copy ``src_key`` to ``dst_key`` within the bucket, server-side.
+
+        Uses the same transfer config as uploads: a single CopyObject up to
+        ``multipart_threshold`` (default 5 GiB, S3's limit for a single copy),
+        and a multipart copy with ``s3_max_concurrency`` threads above it.
+        boto3's own defaults would split anything over 8 MiB into parallel
+        UploadPartCopy requests.
+        """
+        full_src = self._full_key(src_key)
+        full_dst = self._full_key(dst_key)
+        extra = dict(self._sse_extra_args)
+        if self._sse_extra_args:
+            # The source is encrypted with the same key
+            extra["CopySourceSSECustomerAlgorithm"] = self._sse_extra_args[
+                "SSECustomerAlgorithm"
+            ]
+            extra["CopySourceSSECustomerKey"] = self._sse_extra_args["SSECustomerKey"]
+        try:
+            self._client.copy(
+                CopySource={"Bucket": self.bucket_name, "Key": full_src},
+                Bucket=self.bucket_name,
+                Key=full_dst,
+                ExtraArgs=extra or None,
+                Config=self._transfer_config,
+            )
+        except ClientError as e:
+            self._wrap_client_error(e, "copy_object", dst_key)
+
     def list_objects(self, prefix=""):
         full_prefix = self._full_key(prefix) if prefix else self._prefix
         paginator = self._client.get_paginator("list_objects_v2")
