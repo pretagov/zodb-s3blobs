@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2 (unreleased)
+
+- Support transactional undo of blob changes. Undoing a transaction that
+  replaced a blob left the restored revision without an S3 object, so reading
+  the blob raised `POSKeyError`. The undo now copies the restored revision's
+  S3 object to the undo transaction's key, server-side, in `tpc_vote`, and
+  fails with `UndoError` if that object is missing. Adds
+  `S3Client.copy_object()`.
+
 ## 1.2.1
 
 - Log why blob downloads fail. Every failed attempt on the download client

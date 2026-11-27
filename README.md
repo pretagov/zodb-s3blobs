@@ -151,6 +151,10 @@ During `pack()`, the base storage is packed first. Then every S3 key whose revis
 
 Versions before 1.2.0 never deleted the blobs of superseded revisions, so the first `pack()` after upgrading can delete a large number of S3 objects at once. Enable bucket versioning or take a backup before that first pack if you want a way back.
 
+### Undo
+
+With a history-preserving base storage (FileStorage, or RelStorage with `keep-history`), transactional undo restores blobs too. The base storage undoes a transaction by writing each object's previous state again under the undo's own transaction id. For each blob in the undone transaction, `tpc_vote` copies the S3 object of the revision being restored to the key for that new transaction id, server-side. An aborted undo deletes the copy again. If the revision being restored has no S3 object, the undo fails with `UndoError` instead of committing a blob that can't be read.
+
 ### S3 Bucket Security
 
 Ensure your S3 bucket has appropriate access controls (Block Public Access enabled, restrictive bucket policy). The minimum IAM policy required by `zodb-s3blobs`:
